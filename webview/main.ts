@@ -4,6 +4,8 @@ import type { AppearanceSettings, MidiExportOptions } from "wave-roll";
 // Extended player interface with new VS Code integration APIs
 interface WaveRollPlayerExtended {
   dispose(): void;
+  seek?(time: number): void | Promise<void>;
+  getState?(): { duration?: number; tempo?: number; currentTime?: number; isPlaying?: boolean };
   applyAppearanceSettings(settings: AppearanceSettings): void;
   onAppearanceChange(
     callback: (settings: AppearanceSettings) => void
@@ -26,8 +28,13 @@ const vscode = acquireVsCodeApi();
 // UI Elements
 let loadingContainer: HTMLElement | null;
 let errorContainer: HTMLElement | null;
+let studioContainer: HTMLElement | null;
 let waveRollContainer: HTMLElement | null;
 let errorMessage: HTMLElement | null;
+let tsvRowsContainer: HTMLElement | null;
+let tsvMeta: HTMLElement | null;
+let tsvToggle: HTMLButtonElement | null;
+let pianoRollMarker: HTMLElement | null;
 
 // State
 let playerInstance: WaveRollPlayerExtended | null = null;
@@ -35,6 +42,35 @@ let currentBlobUrl: string | null = null;
 let appearanceChangeUnsubscribe: (() => void) | null = null;
 let pendingSettingsRequest: boolean = false;
 let trackRowAdjustObserver: MutationObserver | null = null;
+let currentTsvIndex: TsvIndex | null = null;
+let activeTsvLine: number | null = null;
+let isPlaying = false;
+let playbackLoopTimer: number | null = null;
+
+interface TsvRow {
+  lineNumber: number;
+  raw: string;
+  type: "S" | "T" | "N" | "P" | "meta" | "blank" | "other";
+  absTick?: number;
+  durTick?: number;
+  trackId?: number;
+  pitch?: string;
+}
+
+interface TempoPoint {
+  tick: number;
+  seconds: number;
+  microsecondsPerBeat: number;
+}
+
+interface TsvIndex {
+  rows: TsvRow[];
+  notes: TsvRow[];
+  tickScale: number;
+  tpq: number;
+  tempos: TempoPoint[];
+  endTick: number;
+}
 
 /**
  * Decodes a Base64 string to Uint8Array.
@@ -142,13 +178,13 @@ function setStatus(
   status: "loading" | "error" | "ready",
   message?: string
 ): void {
-  if (!loadingContainer || !errorContainer || !waveRollContainer) {
+  if (!loadingContainer || !errorContainer || !studioContainer) {
     return;
   }
 
   loadingContainer.classList.toggle("hidden", status !== "loading");
   errorContainer.classList.toggle("hidden", status !== "error");
-  waveRollContainer.classList.toggle("hidden", status !== "ready");
+  studioContainer.classList.toggle("hidden", status !== "ready");
 
   if (status === "error" && errorMessage && message) {
     errorMessage.textContent = message;
@@ -221,6 +257,9 @@ async function initializeWaveRollPlayer(
 
     // Setup listener to save appearance changes
     setupAppearanceChangeListener();
+
+    // Start playback loop for TSV auto-scroll
+    startPlaybackLoop();
   } catch (playerError) {
     console.error("[WaveRoll] createWaveRollPlayer() failed:", playerError);
     throw playerError;
@@ -235,7 +274,7 @@ function handleMessage(event: MessageEvent): void {
 
   switch (message.type) {
     case "midi-data":
-      handleMidiData(message.data, message.filename);
+      handleMidiData(message.data, message.filename, message.tsv);
       break;
 
     case "settings-loaded":
@@ -318,6 +357,357 @@ function setupAppearanceChangeListener(): void {
       saveAppearanceSettings(settings);
     }
   );
+}
+
+function renderTsvPanel(tsv: string): void {
+  if (!tsvRowsContainer) {
+    return;
+  }
+
+  currentTsvIndex = parseTsvIndex(tsv);
+  activeTsvLine = null;
+  tsvRowsContainer.textContent = "";
+
+  if (tsvMeta) {
+    tsvMeta.textContent = `${currentTsvIndex.notes.length} notes · ${currentTsvIndex.rows.length} lines`;
+  }
+
+  for (const row of currentTsvIndex.rows) {
+    const rowElement = document.createElement("div");
+    rowElement.className = `tsv-row tsv-row-${row.type}`;
+    rowElement.dataset.line = String(row.lineNumber);
+    rowElement.dataset.type = row.type;
+    rowElement.innerHTML = `<span class="tsv-line-number">${row.lineNumber}</span><span class="tsv-line-text"></span>`;
+    const textElement = rowElement.querySelector<HTMLElement>(".tsv-line-text");
+    if (textElement) {
+      textElement.textContent = row.raw || " ";
+    }
+
+    if (row.absTick !== undefined) {
+      rowElement.addEventListener("mouseenter", () => {
+        highlightTsvLine(row.lineNumber, false);
+        showPianoRollMarker(row.absTick ?? 0);
+        if (!isPlaying) {
+          seekPlayerToTick(row.absTick ?? 0);
+        }
+      });
+    }
+
+    tsvRowsContainer.appendChild(rowElement);
+  }
+}
+
+function parseTsvIndex(tsv: string): TsvIndex {
+  const rawLines = tsv.split(/\r?\n/);
+  const rows: TsvRow[] = [];
+  let tickScale = 1;
+  let tpq = 480;
+  let currentSliceStart = 0;
+  let currentTrackId: number | undefined;
+  const tempoEvents: Array<{ tick: number; microsecondsPerBeat: number }> = [];
+  let endTick = 0;
+
+  rawLines.forEach((raw, index) => {
+    const lineNumber = index + 1;
+    const trimmed = raw.trim();
+
+    if (!trimmed) {
+      rows.push({ lineNumber, raw, type: "blank" });
+      return;
+    }
+
+    if (trimmed.startsWith("#")) {
+      const body = trimmed.slice(1).trim();
+      const separatorIndex = body.indexOf("=");
+      if (separatorIndex !== -1) {
+        const key = body.slice(0, separatorIndex);
+        const value = body.slice(separatorIndex + 1);
+        if (key === "tick_scale") {
+          tickScale = parsePositiveNumber(value, tickScale);
+        } else if (key === "tpq") {
+          tpq = parsePositiveNumber(value, tpq);
+        } else if (key === "tempo") {
+          const [tick, microsecondsPerBeat] = value
+            .split(",")
+            .map((part) => Number(part));
+          if (Number.isFinite(tick) && Number.isFinite(microsecondsPerBeat)) {
+            tempoEvents.push({
+              tick: tick * tickScale,
+              microsecondsPerBeat,
+            });
+          }
+        }
+      }
+      rows.push({ lineNumber, raw, type: "meta" });
+      return;
+    }
+
+    const fields = raw.split("\t");
+    if (fields[0] === "S" && fields.length >= 4) {
+      currentSliceStart = Number(fields[2]) * tickScale;
+      endTick = Math.max(endTick, Number(fields[3]) * tickScale);
+      rows.push({
+        lineNumber,
+        raw,
+        type: "S",
+        absTick: currentSliceStart,
+      });
+      return;
+    }
+
+    if (fields[0] === "T" && fields.length >= 2) {
+      currentTrackId = Number(fields[1]);
+      rows.push({ lineNumber, raw, type: "T", trackId: currentTrackId });
+      return;
+    }
+
+    if (isAbcPitch(fields[0]) && fields.length >= 4) {
+      const absTick = currentSliceStart + Number(fields[1]) * tickScale;
+      const durTick = Number(fields[2]) * tickScale;
+      endTick = Math.max(endTick, absTick + durTick);
+      rows.push({
+        lineNumber,
+        raw,
+        type: "N",
+        absTick,
+        durTick,
+        trackId: currentTrackId,
+        pitch: fields[0],
+      });
+      return;
+    }
+
+    if (fields[0] === "P" && fields.length >= 3) {
+      const absTick = currentSliceStart + Number(fields[1]) * tickScale;
+      rows.push({
+        lineNumber,
+        raw,
+        type: "P",
+        absTick,
+        trackId: currentTrackId,
+      });
+      return;
+    }
+
+    rows.push({ lineNumber, raw, type: "other" });
+  });
+
+  const tempos = buildTempoMap(tempoEvents, tpq);
+  return {
+    rows,
+    notes: rows.filter((row) => row.type === "N" && row.absTick !== undefined),
+    tickScale,
+    tpq,
+    tempos,
+    endTick,
+  };
+}
+
+function buildTempoMap(
+  tempoEvents: Array<{ tick: number; microsecondsPerBeat: number }>,
+  tpq: number
+): TempoPoint[] {
+  const sorted = [...tempoEvents]
+    .sort((a, b) => a.tick - b.tick)
+    .filter((event, index, all) => index === 0 || event.tick !== all[index - 1].tick);
+
+  if (sorted.length === 0 || sorted[0].tick !== 0) {
+    sorted.unshift({ tick: 0, microsecondsPerBeat: 500000 });
+  }
+
+  let seconds = 0;
+  let previous = sorted[0];
+  const points: TempoPoint[] = [
+    {
+      tick: previous.tick,
+      seconds: 0,
+      microsecondsPerBeat: previous.microsecondsPerBeat,
+    },
+  ];
+
+  for (let i = 1; i < sorted.length; i++) {
+    const event = sorted[i];
+    seconds += ticksToSeconds(
+      event.tick - previous.tick,
+      previous.microsecondsPerBeat,
+      tpq
+    );
+    points.push({
+      tick: event.tick,
+      seconds,
+      microsecondsPerBeat: event.microsecondsPerBeat,
+    });
+    previous = event;
+  }
+
+  return points;
+}
+
+function parsePositiveNumber(value: string, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function tickToSeconds(tick: number): number {
+  if (!currentTsvIndex) {
+    return 0;
+  }
+
+  const tempo = findTempoPoint(tick);
+  return (
+    tempo.seconds +
+    ticksToSeconds(tick - tempo.tick, tempo.microsecondsPerBeat, currentTsvIndex.tpq)
+  );
+}
+
+function findTempoPoint(tick: number): TempoPoint {
+  const tempos = currentTsvIndex?.tempos;
+  if (!tempos || tempos.length === 0) {
+    return { tick: 0, seconds: 0, microsecondsPerBeat: 500000 };
+  }
+
+  let selected = tempos[0];
+  for (const tempo of tempos) {
+    if (tempo.tick <= tick) {
+      selected = tempo;
+    } else {
+      break;
+    }
+  }
+  return selected;
+}
+
+function ticksToSeconds(
+  ticks: number,
+  microsecondsPerBeat: number,
+  tpq: number
+): number {
+  return (ticks * microsecondsPerBeat) / tpq / 1_000_000;
+}
+
+function seekPlayerToTick(tick: number): void {
+  if (!playerInstance?.seek) {
+    return;
+  }
+
+  void playerInstance.seek(tickToSeconds(tick));
+}
+
+function showPianoRollMarker(tick: number): void {
+  if (!waveRollContainer || !currentTsvIndex) {
+    return;
+  }
+
+  if (!pianoRollMarker) {
+    pianoRollMarker = document.createElement("div");
+    pianoRollMarker.id = "piano-roll-tsv-marker";
+    waveRollContainer.appendChild(pianoRollMarker);
+  }
+
+  const duration = getPlayerDurationSeconds();
+  const seconds = tickToSeconds(tick);
+  const ratio =
+    duration > 0
+      ? clamp(seconds / duration, 0, 1)
+      : clamp(tick / Math.max(1, currentTsvIndex.endTick), 0, 1);
+  pianoRollMarker.style.left = `${ratio * 100}%`;
+  pianoRollMarker.classList.add("visible");
+}
+
+function highlightTsvLine(lineNumber: number, shouldScroll: boolean): void {
+  if (!tsvRowsContainer || activeTsvLine === lineNumber) {
+    return;
+  }
+
+  if (activeTsvLine !== null) {
+    tsvRowsContainer
+      .querySelector(`[data-line="${activeTsvLine}"]`)
+      ?.classList.remove("active");
+  }
+
+  activeTsvLine = lineNumber;
+  const row = tsvRowsContainer.querySelector<HTMLElement>(
+    `[data-line="${lineNumber}"]`
+  );
+  row?.classList.add("active");
+  if (row && shouldScroll) {
+    row.scrollIntoView({ block: "nearest" });
+  }
+}
+
+function getPlayerDurationSeconds(): number {
+  const duration = playerInstance?.getState?.().duration;
+  if (typeof duration === "number" && Number.isFinite(duration) && duration > 0) {
+    return duration;
+  }
+
+  if (!currentTsvIndex) {
+    return 0;
+  }
+  return tickToSeconds(currentTsvIndex.endTick);
+}
+
+function startPlaybackLoop(): void {
+  stopPlaybackLoop();
+  const poll = () => {
+    if (!playerInstance?.getState || !currentTsvIndex) {
+      isPlaying = false;
+      return;
+    }
+    const state = playerInstance.getState();
+    isPlaying = !!state.isPlaying;
+    if (isPlaying && tsvRowsContainer) {
+      // Use playhead ratio within duration, map to TSV note range
+      const duration = state.duration ?? 0;
+      const currentTime = state.currentTime ?? 0;
+      const ratio = duration > 0 ? clamp(currentTime / duration, 0, 1) : 0;
+
+      let lastNoteEndTick = 0;
+      for (const n of currentTsvIndex.notes) {
+        const end = (n.absTick ?? 0) + (n.durTick ?? 0);
+        if (end > lastNoteEndTick) lastNoteEndTick = end;
+      }
+      const currentTick = Math.round(ratio * lastNoteEndTick);
+
+      const notes = currentTsvIndex.notes.filter(
+        (n) => n.trackId === 0 || n.trackId === undefined
+      );
+      const activeNotes = notes.filter((n) => {
+        const start = n.absTick ?? 0;
+        const end = start + (n.durTick ?? 0);
+        return currentTick >= start && currentTick <= end;
+      });
+      if (activeNotes.length > 0) {
+        highlightTsvLine(activeNotes[0].lineNumber, true);
+      }
+    } else if (!isPlaying && tsvRowsContainer) {
+      // When playback stops, clear the active line
+      if (activeTsvLine !== null) {
+        tsvRowsContainer
+          .querySelector(`[data-line="${activeTsvLine}"]`)
+          ?.classList.remove("active");
+        activeTsvLine = null;
+      }
+    }
+    playbackLoopTimer = window.setTimeout(poll, 100);
+  };
+  poll();
+}
+
+function stopPlaybackLoop(): void {
+  if (playbackLoopTimer) {
+    clearTimeout(playbackLoopTimer);
+    playbackLoopTimer = null;
+  }
+  isPlaying = false;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function isAbcPitch(s: string): boolean {
+  return /^[_^=]*[A-Ga-g]['|,]*$/.test(s);
 }
 
 // State for file add request listeners
@@ -462,9 +852,14 @@ async function waitForContainerLayout(
  */
 async function handleMidiData(
   base64Data: string,
-  filename: string
+  filename: string,
+  tsv?: string
 ): Promise<void> {
   try {
+    if (tsv) {
+      renderTsvPanel(tsv);
+    }
+
     // Show the container before initializing (so it has dimensions)
     setStatus("ready");
 
@@ -500,11 +895,16 @@ function initialize(): void {
   // Get UI elements
   loadingContainer = document.getElementById("loading-container");
   errorContainer = document.getElementById("error-container");
+  studioContainer = document.getElementById("studio-container");
   waveRollContainer = document.getElementById("wave-roll-container");
   errorMessage = document.getElementById("error-message");
+  tsvRowsContainer = document.getElementById("tsv-rows");
+  tsvMeta = document.getElementById("tsv-meta");
+  tsvToggle = document.getElementById("tsv-toggle") as HTMLButtonElement | null;
 
   // Listen for messages from extension
   window.addEventListener("message", handleMessage);
+  tsvToggle?.addEventListener("click", toggleTsvPanel);
 
   // Cleanup on page unload
   window.addEventListener("beforeunload", () => {
@@ -520,6 +920,7 @@ function initialize(): void {
       audioFileAddRequestUnsubscribe();
       audioFileAddRequestUnsubscribe = null;
     }
+    stopPlaybackLoop();
     if (playerInstance) {
       playerInstance.dispose();
       playerInstance = null;
@@ -530,6 +931,22 @@ function initialize(): void {
 
   // Notify extension that webview is ready
   vscode.postMessage({ type: "ready" });
+}
+
+function toggleTsvPanel(): void {
+  if (!studioContainer || !tsvToggle) {
+    return;
+  }
+
+  const collapsed = studioContainer.classList.toggle("tsv-collapsed");
+  tsvToggle.textContent = collapsed ? "‹" : "›";
+  tsvToggle.title = collapsed
+    ? "Expand MIDI-TSV panel"
+    : "Collapse MIDI-TSV panel";
+  tsvToggle.setAttribute(
+    "aria-label",
+    collapsed ? "Expand MIDI-TSV panel" : "Collapse MIDI-TSV panel"
+  );
 }
 
 // Initialize when DOM is loaded

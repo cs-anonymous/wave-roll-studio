@@ -1,17 +1,19 @@
 /* CSS Variables for theming */
 :root {
   --bg-primary: #ffffff;
-  --bg-secondary: #252526;
-  --text-primary: #cccccc;
-  --text-secondary: #969696;
+  --bg-secondary: #f1f5f9;
+  --text-primary: #0f172a;
+  --text-secondary: #475569;
   --error-color: #f14c4c;
-  --border-color: #3c3c3c;
+  --border-color: #cbd5e1;
   --spinner-color: #0e639c;
-
-  /* Wave-roll theme variables (Light Theme Forced) */
   --surface: #ffffff;
   --surface-alt: #f8f9fa;
   --panel-bg: #ffffff;
+  --panel-header: #f8fafc;
+  --code-bg: #ffffff;
+  --code-row: #334155;
+  --code-line-number: #94a3b8;
   --text-muted: #475569;
   --ui-border: #e2e8f0;
   --track-bg: #f1f5f9;
@@ -28,6 +30,33 @@
     0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
 }
 
+body.vscode-dark,
+body.vscode-high-contrast {
+  --bg-primary: #0f172a;
+  --bg-secondary: #111827;
+  --text-primary: #e5e7eb;
+  --text-secondary: #94a3b8;
+  --border-color: #334155;
+  --spinner-color: #60a5fa;
+  --surface: #0f172a;
+  --surface-alt: #111827;
+  --panel-bg: #111827;
+  --panel-header: #020617;
+  --code-bg: #0f172a;
+  --code-row: #cbd5e1;
+  --code-line-number: #64748b;
+  --text-muted: #94a3b8;
+  --ui-border: #334155;
+  --track-bg: #1e293b;
+  --accent: #60a5fa;
+  --accent-strong: #3b82f6;
+  --on-accent: #020617;
+  --hover-surface: #1e293b;
+  --focus-ring: #60a5fa;
+  --shadow-sm: none;
+  --shadow-md: none;
+}
+
 /* Reset and base styles */
 * {
   margin: 0;
@@ -39,8 +68,7 @@ html,
 body {
   width: 100%;
   height: 100%;
-  overflow-y: auto;
-  overflow-x: hidden;
+  overflow: hidden;
   background-color: var(--bg-primary);
   color: var(--text-primary);
   font-family:
@@ -103,13 +131,182 @@ body {
   text-align: center;
 }
 
-/* WaveRoll container - takes full available space */
-#wave-roll-container {
+/* Main studio split: piano roll beside MIDI-TSV */
+#studio-container {
   flex: 1;
   width: 100%;
   min-height: 100%;
-  overflow: visible;
+  display: flex;
+  flex-direction: row;
+  overflow: hidden;
+  background: var(--surface);
+}
+
+#wave-roll-container {
+  flex: 1 1 auto;
+  min-width: 0;
+  width: 100%;
+  min-height: 100%;
+  overflow: hidden;
   position: relative;
+  background: var(--surface);
+}
+
+#piano-roll-tsv-marker {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  pointer-events: none;
+  background: #f59e0b;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.7), 0 0 14px rgba(245, 158, 11, 0.8);
+  opacity: 0;
+  transform: translateX(-1px);
+  transition: opacity 120ms ease;
+  z-index: 20;
+}
+
+#piano-roll-tsv-marker.visible {
+  opacity: 1;
+}
+
+#tsv-panel {
+  flex: 0 0 clamp(220px, 26vw, 380px);
+  min-width: 180px;
+  max-width: 35vw;
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--ui-border);
+  background: var(--code-bg);
+  color: var(--code-row);
+  transition:
+    flex-basis 160ms ease,
+    min-width 160ms ease;
+}
+
+#studio-container.tsv-collapsed #tsv-panel {
+  flex-basis: 36px;
+  min-width: 36px;
+  max-width: 36px;
+}
+
+#studio-container.tsv-collapsed #tsv-title,
+#studio-container.tsv-collapsed #tsv-meta,
+#studio-container.tsv-collapsed #tsv-rows {
+  display: none;
+}
+
+#studio-container.tsv-collapsed #tsv-panel-header {
+  justify-content: center;
+  padding: 0;
+}
+
+#tsv-panel-header {
+  height: 36px;
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 8px 0 12px;
+  border-bottom: 1px solid var(--ui-border);
+  background: var(--panel-header);
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+#tsv-title {
+  flex: 0 0 auto;
+}
+
+#tsv-meta {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-secondary);
+  font-weight: 500;
+  overflow: hidden;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#tsv-toggle {
+  flex: 0 0 24px;
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--ui-border);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--text-primary);
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+}
+
+#tsv-toggle:hover {
+  background: var(--hover-surface);
+}
+
+#tsv-rows {
+  flex: 1;
+  overflow: auto;
+  font-family:
+    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+    monospace;
+  font-size: 12px;
+  line-height: 18px;
+  white-space: pre;
+}
+
+.tsv-row {
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr);
+  min-height: 18px;
+  color: var(--code-row);
+}
+
+.tsv-row:hover {
+  background: rgba(59, 130, 246, 0.18);
+}
+
+.tsv-row.active {
+  background: rgba(245, 158, 11, 0.28);
+  color: #fff7ed;
+}
+
+.tsv-line-number {
+  padding: 0 8px;
+  color: var(--code-line-number);
+  text-align: right;
+  user-select: none;
+  border-right: 1px solid rgba(148, 163, 184, 0.16);
+}
+
+.tsv-line-text {
+  padding: 0 10px;
+  overflow: hidden;
+  text-overflow: clip;
+}
+
+.tsv-row-meta {
+  color: var(--accent-strong);
+}
+
+.tsv-row-S,
+.tsv-row-T {
+  color: #fbbf24;
+}
+
+.tsv-row-P {
+  color: #c4b5fd;
+}
+
+.tsv-row-N {
+  color: var(--code-row);
 }
 
 /* Scrollbar styling */
@@ -119,7 +316,7 @@ body {
 }
 
 ::-webkit-scrollbar-track {
-  background: var(--bg-secondary);
+  background: var(--surface-alt);
 }
 
 ::-webkit-scrollbar-thumb {
@@ -128,7 +325,7 @@ body {
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #4c4c4c;
+  background: var(--text-secondary);
 }
 
 /* Volume sliders styling (file and track volumes) */

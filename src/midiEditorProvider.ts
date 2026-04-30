@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import * as crypto from "crypto";
+import { isMidiTsvUriPath, midiToTsv, tsvToMidi } from "./midiTsv";
 
 /**
  * Custom document for MIDI files.
@@ -8,6 +9,8 @@ import * as crypto from "crypto";
 interface MidiDocument extends vscode.CustomDocument {
   readonly uri: vscode.Uri;
   readonly data: Uint8Array;
+  readonly filename: string;
+  readonly tsv: string;
 }
 
 /**
@@ -73,10 +76,21 @@ export class MidiEditorProvider
     _openContext: vscode.CustomDocumentOpenContext,
     _token: vscode.CancellationToken
   ): Promise<MidiDocument> {
-    const data = await vscode.workspace.fs.readFile(uri);
+    const rawData = await vscode.workspace.fs.readFile(uri);
+    const isTsv = isMidiTsvUriPath(uri.path);
+    const data = isTsv
+      ? tsvToMidi(new TextDecoder("utf-8").decode(rawData))
+      : rawData;
+    const filename = this.getDocumentFilename(uri);
+    const tsv = isTsv
+      ? new TextDecoder("utf-8").decode(rawData)
+      : midiToTsv(data, filename);
+
     return {
       uri,
       data,
+      filename,
+      tsv,
       dispose: () => {
         // Cleanup if needed
       },
@@ -176,7 +190,7 @@ export class MidiEditorProvider
         canSelectFiles: true,
         canSelectFolders: false,
         filters: {
-          "MIDI Files": ["mid", "midi"],
+          "MIDI Files": ["mid", "midi", "tsv"],
         },
         title: "Add MIDI Files",
       });
@@ -188,8 +202,15 @@ export class MidiEditorProvider
       // Read each file and send to webview
       for (const uri of uris) {
         try {
-          const data = await vscode.workspace.fs.readFile(uri);
-          const filename = uri.path.split("/").pop() ?? "unknown";
+          const rawData = await vscode.workspace.fs.readFile(uri);
+          const isTsv = isMidiTsvUriPath(uri.path);
+          if (uri.path.toLowerCase().endsWith(".tsv") && !isTsv) {
+            throw new Error("Expected a .mid.tsv or .midi.tsv file");
+          }
+          const data = isTsv
+            ? tsvToMidi(new TextDecoder("utf-8").decode(rawData))
+            : rawData;
+          const filename = this.getDocumentFilename(uri);
           const base64Data = Buffer.from(data).toString("base64");
 
           webview.postMessage({
@@ -338,8 +359,17 @@ export class MidiEditorProvider
     webview.postMessage({
       type: "midi-data",
       data: base64Data,
-      filename: document.uri.path.split("/").pop() ?? "unknown.mid",
+      filename: document.filename,
+      tsv: document.tsv,
     });
+  }
+
+  private getDocumentFilename(uri: vscode.Uri): string {
+    const filename = uri.path.split("/").pop() ?? "unknown.mid";
+    if (isMidiTsvUriPath(uri.path)) {
+      return filename.replace(/\.tsv$/i, "");
+    }
+    return filename;
   }
 
   /**
@@ -404,7 +434,17 @@ export class MidiEditorProvider
       <p class="error-icon">⚠️</p>
       <p id="error-message">An error occurred</p>
     </div>
-    <div id="wave-roll-container" class="hidden"></div>
+    <div id="studio-container" class="hidden">
+      <div id="wave-roll-container"></div>
+      <section id="tsv-panel">
+        <div id="tsv-panel-header">
+          <span id="tsv-title">MIDI-TSV</span>
+          <span id="tsv-meta"></span>
+          <button id="tsv-toggle" type="button" title="Collapse MIDI-TSV panel" aria-label="Collapse MIDI-TSV panel">›</button>
+        </div>
+        <div id="tsv-rows"></div>
+      </section>
+    </div>
   </div>
   <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>

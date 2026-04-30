@@ -37,11 +37,41 @@
           },
           {
             "filenamePattern": "*.midi"
+          },
+          {
+            "filenamePattern": "*.mid.tsv"
+          },
+          {
+            "filenamePattern": "*.midi.tsv"
           }
         ],
         "priority": "default"
       }
-    ]
+    ],
+    "commands": [
+      {
+        "command": "wave-roll-studio.exportMidiTsv",
+        "title": "WaveRoll: Export MIDI as TSV"
+      },
+      {
+        "command": "wave-roll-studio.exportTsvMidi",
+        "title": "WaveRoll: Export MIDI-TSV as MIDI"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "wave-roll-studio.exportMidiTsv",
+          "when": "resourceExtname == .mid || resourceExtname == .midi",
+          "group": "navigation@20"
+        },
+        {
+          "command": "wave-roll-studio.exportTsvMidi",
+          "when": "resourceFilename =~ /\\.midi?\\.tsv$/",
+          "group": "navigation@21"
+        }
+      ]
+    }
   },
   "scripts": {
     "build": "node esbuild.mjs",
@@ -59,6 +89,7 @@
   },
   "dependencies": {
     "@tonejs/midi": "^2.0.28",
+    "midi-file": "1.2.4",
     "tone": "^15.1.22",
     "wave-roll": "0.4.0"
   }
