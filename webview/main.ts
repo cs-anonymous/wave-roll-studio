@@ -1,9 +1,12 @@
 import { createWaveRollPlayer } from "wave-roll";
 import type { AppearanceSettings, MidiExportOptions } from "wave-roll";
 
-// Extended player interface with new VS Code integration APIs
+// Extended player interface with VS Code integration APIs
 interface WaveRollPlayerExtended {
   dispose(): void;
+  pianoRollManager?: {
+    getPianoRollInstance(): any | null;
+  } | null;
   seek?(time: number): void | Promise<void>;
   getState?(): { duration?: number; tempo?: number; currentTime?: number; isPlaying?: boolean };
   applyAppearanceSettings(settings: AppearanceSettings): void;
@@ -34,11 +37,14 @@ let errorMessage: HTMLElement | null;
 let tsvRowsContainer: HTMLElement | null;
 let tsvMeta: HTMLElement | null;
 let tsvToggle: HTMLButtonElement | null;
-let pianoRollMarker: HTMLElement | null;
+let pianoSoundSelect: HTMLSelectElement | null;
 
 // State
 let playerInstance: WaveRollPlayerExtended | null = null;
 let currentBlobUrl: string | null = null;
+let currentMidiBytes: Uint8Array | null = null;
+let currentFilename: string | null = null;
+let currentTsv: string | null = null;
 let appearanceChangeUnsubscribe: (() => void) | null = null;
 let pendingSettingsRequest: boolean = false;
 let trackRowAdjustObserver: MutationObserver | null = null;
@@ -46,6 +52,11 @@ let currentTsvIndex: TsvIndex | null = null;
 let activeTsvLine: number | null = null;
 let isPlaying = false;
 let playbackLoopTimer: number | null = null;
+let currentPianoSound: "default" | "salamander" = "default";
+
+// TSV editing mode
+let tsvEditMode: "preview" | "edit" = "preview";
+let tsvEditor: HTMLTextAreaElement | null = null;
 
 interface TsvRow {
   lineNumber: number;
@@ -212,6 +223,11 @@ async function initializeWaveRollPlayer(
   // Create Blob URL from MIDI bytes
   currentBlobUrl = createMidiBlobUrl(midiBytes);
 
+  // Set piano sound preference before initializing the player
+  // The bundled code reads this global to determine which sample URL to use
+  (window as Window & { __waveRollPianoSound?: string }).__waveRollPianoSound = currentPianoSound;
+  console.log("[WaveRoll] Piano sound set to:", currentPianoSound);
+
   // Create the WaveRoll player with the Blob URL
   // Multi-file mode enabled (soloMode: false) for file comparison features
   try {
@@ -267,6 +283,119 @@ async function initializeWaveRollPlayer(
 }
 
 /**
+ * Switches the piano sound and restarts the player.
+ */
+async function switchPianoSound(sound: "default" | "salamander"): Promise<void> {
+  if (sound === currentPianoSound) return;
+  currentPianoSound = sound;
+
+  // Update selector UI if it exists
+  if (pianoSoundSelect) {
+    pianoSoundSelect.value = sound;
+  }
+
+  // Save setting to extension
+  vscode.postMessage({
+    type: "save-settings",
+    settings: {
+      paletteId: "default",
+      pianoSound: sound,
+    },
+  });
+
+  // Restart player with new sound if we have MIDI data
+  if (currentMidiBytes && currentFilename) {
+    await initializeWaveRollPlayer(currentMidiBytes, currentFilename);
+  }
+}
+
+/**
+ * Creates the piano sound selector and injects it into the TSV panel header.
+ */
+function createPianoSoundSelector(): void {
+  const tsvHeader = document.getElementById("tsv-panel-header");
+  if (!tsvHeader || pianoSoundSelect) return;
+
+  const wrapper = document.createElement("div");
+  wrapper.style.display = "flex";
+  wrapper.style.alignItems = "center";
+  wrapper.style.gap = "4px";
+  wrapper.style.marginRight = "auto";
+
+  pianoSoundSelect = document.createElement("select");
+  pianoSoundSelect.id = "piano-sound-selector";
+  pianoSoundSelect.title = "Choose piano sound source";
+  pianoSoundSelect.style.cssText = `
+    font-size: 10px;
+    padding: 2px 4px;
+    border: 1px solid var(--ui-border);
+    border-radius: 4px;
+    background: var(--surface);
+    color: var(--text-primary);
+    cursor: pointer;
+    outline: none;
+    height: 20px;
+    max-width: 100px;
+    min-width: 60px;
+  `;
+  pianoSoundSelect.addEventListener("mouseenter", () => {
+    pianoSoundSelect!.style.borderColor = "var(--accent)";
+  });
+  pianoSoundSelect.addEventListener("mouseleave", () => {
+    pianoSoundSelect!.style.borderColor = "var(--ui-border)";
+  });
+
+  const defaultOption = document.createElement("option");
+  defaultOption.value = "default";
+  defaultOption.textContent = "Default";
+  const salamanderOption = document.createElement("option");
+  salamanderOption.value = "salamander";
+  salamanderOption.textContent = "Salamander C5";
+
+  pianoSoundSelect.appendChild(defaultOption);
+  pianoSoundSelect.appendChild(salamanderOption);
+  pianoSoundSelect.value = currentPianoSound;
+
+  pianoSoundSelect.addEventListener("change", () => {
+    const sound = pianoSoundSelect!.value as "default" | "salamander";
+    void switchPianoSound(sound);
+  });
+
+  wrapper.appendChild(pianoSoundSelect);
+  tsvHeader.appendChild(wrapper);
+
+  // Create edit toggle button
+  const editToggle = document.createElement("button");
+  editToggle.id = "tsv-edit-toggle";
+  editToggle.type = "button";
+  editToggle.textContent = "✎";
+  editToggle.title = "Edit MIDI-TSV";
+  editToggle.setAttribute("aria-label", "Edit MIDI-TSV");
+  editToggle.style.cssText = `
+    flex: 0 0 22px;
+    width: 22px;
+    height: 22px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--ui-border);
+    border-radius: 4px;
+    background: var(--surface);
+    color: var(--text-primary);
+    cursor: pointer;
+    font-size: 13px;
+  `;
+  editToggle.addEventListener("mouseenter", () => {
+    editToggle.style.background = "var(--hover-surface)";
+  });
+  editToggle.addEventListener("mouseleave", () => {
+    editToggle.style.background = "var(--surface)";
+  });
+  editToggle.addEventListener("click", toggleTsvEditMode);
+  tsvHeader.appendChild(editToggle);
+}
+
+/**
  * Handles messages from the extension host.
  */
 function handleMessage(event: MessageEvent): void {
@@ -282,12 +411,31 @@ function handleMessage(event: MessageEvent): void {
       if (message.settings && playerInstance) {
         playerInstance.applyAppearanceSettings(message.settings);
       }
+      // Restore saved piano sound preference
+      if (message.settings?.pianoSound) {
+        const sound = message.settings.pianoSound as "default" | "salamander";
+        if (sound !== currentPianoSound) {
+          currentPianoSound = sound;
+          if (pianoSoundSelect) {
+            pianoSoundSelect.value = sound;
+          }
+          // Restart with saved sound if we have MIDI data
+          if (currentMidiBytes && currentFilename) {
+            void initializeWaveRollPlayer(currentMidiBytes, currentFilename);
+          }
+        }
+      }
       pendingSettingsRequest = false;
       break;
 
     case "file-added":
       // Handle file added via VS Code file dialog
       handleFileAdded(message.data, message.filename);
+      break;
+
+    case "tsv-saved":
+      // TSV edit saved successfully
+      handleTsvSaved(message.tsv);
       break;
   }
 }
@@ -315,6 +463,94 @@ async function handleFileAdded(
       type: "error",
       message: errorMsg,
     });
+  }
+}
+
+/**
+ * Toggles TSV panel between preview and edit mode.
+ */
+function toggleTsvEditMode(): void {
+  if (tsvEditMode === "preview") {
+    tsvEditMode = "edit";
+    renderTsvEditor();
+  } else {
+    tsvEditMode = "preview";
+    tsvRowsContainer?.style.removeProperty("display");
+    if (currentTsv) {
+      renderTsvPanel(currentTsv);
+    }
+  }
+  // Update toggle button text
+  const editToggle = document.getElementById("tsv-edit-toggle");
+  if (editToggle) {
+    editToggle.textContent = tsvEditMode === "preview" ? "✎" : "⇄";
+    editToggle.title = tsvEditMode === "preview" ? "Edit MIDI-TSV" : "Preview MIDI-TSV";
+  }
+}
+
+/**
+ * Renders TSV as an editable textarea with line numbers.
+ */
+function renderTsvEditor(): void {
+  if (!tsvRowsContainer || !currentTsv) return;
+
+  tsvRowsContainer.textContent = "";
+  tsvRowsContainer.style.display = "flex";
+
+  const lineNumbers = document.createElement("div");
+  lineNumbers.id = "tsv-editor-gutter";
+
+  const lineCount = currentTsv.split(/\r?\n/).length;
+  for (let i = 1; i <= lineCount; i++) {
+    const span = document.createElement("span");
+    span.className = "tsv-editor-line-num";
+    span.textContent = String(i);
+    lineNumbers.appendChild(span);
+  }
+
+  tsvEditor = document.createElement("textarea");
+  tsvEditor.id = "tsv-editor";
+  tsvEditor.value = currentTsv;
+  tsvEditor.spellcheck = false;
+  tsvEditor.autocapitalize = "off";
+  tsvEditor.autocomplete = "off";
+
+  tsvRowsContainer.appendChild(lineNumbers);
+  tsvRowsContainer.appendChild(tsvEditor);
+  tsvEditor.focus();
+
+  // Sync gutter scroll with textarea
+  tsvEditor.addEventListener("scroll", () => {
+    lineNumbers.scrollTop = tsvEditor!.scrollTop;
+  });
+}
+
+/**
+ * Saves edited TSV by converting back to MIDI and writing to disk.
+ */
+function saveTsvEdit(): void {
+  if (!tsvEditor) return;
+
+  const editedTsv = tsvEditor.value;
+  vscode.postMessage({
+    type: "tsv-edit",
+    tsv: editedTsv,
+  });
+}
+
+/**
+ * Handles TSV save confirmation from extension.
+ */
+function handleTsvSaved(newTsv: string): void {
+  currentTsv = newTsv;
+  // Switch back to preview mode
+  tsvEditMode = "preview";
+  tsvRowsContainer?.style.removeProperty("display");
+  renderTsvPanel(newTsv);
+  const editToggle = document.getElementById("tsv-edit-toggle");
+  if (editToggle) {
+    editToggle.textContent = "✎";
+    editToggle.title = "Edit MIDI-TSV";
   }
 }
 
@@ -384,9 +620,8 @@ function renderTsvPanel(tsv: string): void {
     }
 
     if (row.absTick !== undefined) {
-      rowElement.addEventListener("mouseenter", () => {
+      rowElement.addEventListener("click", () => {
         highlightTsvLine(row.lineNumber, false);
-        showPianoRollMarker(row.absTick ?? 0);
         if (!isPlaying) {
           seekPlayerToTick(row.absTick ?? 0);
         }
@@ -593,27 +828,6 @@ function seekPlayerToTick(tick: number): void {
   void playerInstance.seek(tickToSeconds(tick));
 }
 
-function showPianoRollMarker(tick: number): void {
-  if (!waveRollContainer || !currentTsvIndex) {
-    return;
-  }
-
-  if (!pianoRollMarker) {
-    pianoRollMarker = document.createElement("div");
-    pianoRollMarker.id = "piano-roll-tsv-marker";
-    waveRollContainer.appendChild(pianoRollMarker);
-  }
-
-  const duration = getPlayerDurationSeconds();
-  const seconds = tickToSeconds(tick);
-  const ratio =
-    duration > 0
-      ? clamp(seconds / duration, 0, 1)
-      : clamp(tick / Math.max(1, currentTsvIndex.endTick), 0, 1);
-  pianoRollMarker.style.left = `${ratio * 100}%`;
-  pianoRollMarker.classList.add("visible");
-}
-
 function highlightTsvLine(lineNumber: number, shouldScroll: boolean): void {
   if (!tsvRowsContainer || activeTsvLine === lineNumber) {
     return;
@@ -633,18 +847,6 @@ function highlightTsvLine(lineNumber: number, shouldScroll: boolean): void {
   if (row && shouldScroll) {
     row.scrollIntoView({ block: "nearest" });
   }
-}
-
-function getPlayerDurationSeconds(): number {
-  const duration = playerInstance?.getState?.().duration;
-  if (typeof duration === "number" && Number.isFinite(duration) && duration > 0) {
-    return duration;
-  }
-
-  if (!currentTsvIndex) {
-    return 0;
-  }
-  return tickToSeconds(currentTsvIndex.endTick);
 }
 
 function startPlaybackLoop(): void {
@@ -871,6 +1073,9 @@ async function handleMidiData(
 
     // Decode base64 to bytes
     const midiBytes = decodeBase64ToUint8Array(base64Data);
+    currentMidiBytes = midiBytes;
+    currentFilename = filename;
+    currentTsv = tsv || null;
 
     // Initialize the WaveRoll player
     await initializeWaveRollPlayer(midiBytes, filename);
@@ -905,6 +1110,19 @@ function initialize(): void {
   // Listen for messages from extension
   window.addEventListener("message", handleMessage);
   tsvToggle?.addEventListener("click", toggleTsvPanel);
+
+  // Cmd/Ctrl+S to save TSV edits
+  document.addEventListener("keydown", (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === "s") {
+      e.preventDefault();
+      if (tsvEditMode === "edit") {
+        saveTsvEdit();
+      }
+    }
+  });
+
+  // Create piano sound selector in the TSV panel header
+  createPianoSoundSelector();
 
   // Cleanup on page unload
   window.addEventListener("beforeunload", () => {

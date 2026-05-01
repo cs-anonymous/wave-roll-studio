@@ -24,6 +24,7 @@ interface AppearanceSettings {
     shape: string;
     variant: "filled" | "outlined";
   };
+  pianoSound?: "default" | "salamander";
 }
 
 /** Storage key prefix for appearance settings */
@@ -36,7 +37,7 @@ const APPEARANCE_STORAGE_PREFIX = "appearance:";
 export class MidiEditorProvider
   implements vscode.CustomReadonlyEditorProvider<MidiDocument>
 {
-  public static readonly viewType = "wave-roll-studio.preview";
+  public static readonly viewType = "wave-roll-piano.preview";
 
   constructor(private readonly context: vscode.ExtensionContext) {}
 
@@ -154,6 +155,16 @@ export class MidiEditorProvider
                 filename: string;
               };
               await this.handleMidiExport(document.uri, base64Data, filename);
+            }
+            break;
+
+          case "tsv-edit":
+            // Handle TSV edit: convert back to MIDI, write to disk, send updated TSV back
+            {
+              const { tsv } = message as { tsv: string };
+              if (tsv) {
+                await this.handleTsvEdit(document, tsv, webviewPanel.webview);
+              }
             }
             break;
 
@@ -352,6 +363,37 @@ export class MidiEditorProvider
   }
 
   /**
+   * Handles TSV edit: converts TSV back to MIDI, writes to disk, sends updated TSV back.
+   */
+  private async handleTsvEdit(
+    document: MidiDocument,
+    editedTsv: string,
+    webview: vscode.Webview
+  ): Promise<void> {
+    try {
+      const newMidiData = tsvToMidi(editedTsv);
+      const newTsv = midiToTsv(newMidiData, document.filename);
+
+      (document as any).data = newMidiData;
+      (document as any).tsv = newTsv;
+
+      await vscode.workspace.fs.writeFile(document.uri, newMidiData);
+
+      webview.postMessage({
+        type: "tsv-saved",
+        tsv: newTsv,
+      });
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : "Unknown error";
+      vscode.window.showErrorMessage(`TSV save failed: ${errorMsg}`);
+      webview.postMessage({
+        type: "tsv-saved",
+        tsv: document.tsv,
+      });
+    }
+  }
+
+  /**
    * Sends MIDI data to the webview as Base64.
    */
   private sendMidiData(webview: vscode.Webview, document: MidiDocument): void {
@@ -397,11 +439,12 @@ export class MidiEditorProvider
     );
 
     // Content Security Policy
-    // Allow Salamander Grand Piano samples from tonejs.github.io
+    // Allow Splendid Grand Piano samples from cdn.jsdelivr.net (jsDelivr CDN)
     // Allow MIDI.js soundfonts from paulrosen.github.io
     // PixiJS requires 'unsafe-eval' for shader compilation
     // Tone.js requires blob: workers for audio scheduling
     // blob: in connect-src is required for loading MIDI data from Blob URLs
+    const pianoSamplesUrl = "https://cdn.jsdelivr.net";
     const salamanderUrl = "https://tonejs.github.io";
     const midijsSoundfontsUrl = "https://paulrosen.github.io";
     const csp = [
@@ -411,8 +454,8 @@ export class MidiEditorProvider
       `worker-src 'self' blob:`,
       `img-src ${webview.cspSource} data: blob:`,
       `font-src ${webview.cspSource}`,
-      `connect-src ${webview.cspSource} ${salamanderUrl} ${midijsSoundfontsUrl} blob:`,
-      `media-src ${webview.cspSource} ${salamanderUrl} ${midijsSoundfontsUrl} blob:`,
+      `connect-src ${webview.cspSource} ${pianoSamplesUrl} ${salamanderUrl} ${midijsSoundfontsUrl} blob:`,
+      `media-src ${webview.cspSource} ${pianoSamplesUrl} ${salamanderUrl} ${midijsSoundfontsUrl} blob:`,
     ].join("; ");
 
     return `<!DOCTYPE html>

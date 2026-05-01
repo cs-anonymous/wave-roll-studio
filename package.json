@@ -1,9 +1,9 @@
 {
-  "name": "wave-roll-studio",
-  "displayName": "WaveRoll Studio - MIDI Player & Viewer",
-  "description": "Comparative MIDI Piano-Roll Visualization & Playback Extension (powered by wave-roll)",
+  "name": "wave-roll-piano",
+  "displayName": "WaveRoll Piano - MIDI Editor",
+  "description": "MIDI piano roll editor with playback, MIDI-TSV conversion, and piano sound selection",
   "publisher": "crescent-stdio",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "icon": "icon.png",
   "repository": {
     "type": "git",
@@ -20,17 +20,20 @@
     "music",
     "midi",
     "piano-roll",
+    "midi-editor",
+    "midi-tsv",
     "midi-visualisation",
     "audio",
-    "visualization"
+    "visualization",
+    "piano"
   ],
   "main": "./dist/extension/extension.js",
   "activationEvents": [],
   "contributes": {
     "customEditors": [
       {
-        "viewType": "wave-roll-studio.preview",
-        "displayName": "WaveRoll Studio",
+        "viewType": "wave-roll-piano.preview",
+        "displayName": "WaveRoll Piano",
         "selector": [
           {
             "filenamePattern": "*.mid"
@@ -50,23 +53,23 @@
     ],
     "commands": [
       {
-        "command": "wave-roll-studio.exportMidiTsv",
-        "title": "WaveRoll: Export MIDI as TSV"
+        "command": "wave-roll-piano.exportMidiTsv",
+        "title": "WaveRoll Piano: Export MIDI as TSV"
       },
       {
-        "command": "wave-roll-studio.exportTsvMidi",
-        "title": "WaveRoll: Export MIDI-TSV as MIDI"
+        "command": "wave-roll-piano.exportTsvMidi",
+        "title": "WaveRoll Piano: Export MIDI-TSV as MIDI"
       }
     ],
     "menus": {
       "explorer/context": [
         {
-          "command": "wave-roll-studio.exportMidiTsv",
+          "command": "wave-roll-piano.exportMidiTsv",
           "when": "resourceExtname == .mid || resourceExtname == .midi",
           "group": "navigation@20"
         },
         {
-          "command": "wave-roll-studio.exportTsvMidi",
+          "command": "wave-roll-piano.exportTsvMidi",
           "when": "resourceFilename =~ /\\.midi?\\.tsv$/",
           "group": "navigation@21"
         }

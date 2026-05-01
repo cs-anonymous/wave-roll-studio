@@ -152,28 +152,11 @@ body {
   background: var(--surface);
 }
 
-#piano-roll-tsv-marker {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  width: 2px;
-  pointer-events: none;
-  background: #f59e0b;
-  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.7), 0 0 14px rgba(245, 158, 11, 0.8);
-  opacity: 0;
-  transform: translateX(-1px);
-  transition: opacity 120ms ease;
-  z-index: 20;
-}
-
-#piano-roll-tsv-marker.visible {
-  opacity: 1;
-}
 
 #tsv-panel {
-  flex: 0 0 clamp(220px, 26vw, 380px);
-  min-width: 180px;
-  max-width: 35vw;
+  flex: 0 0 clamp(180px, 22vw, 320px);
+  min-width: 120px;
+  max-width: 28vw;
   min-height: 100%;
   display: flex;
   flex-direction: column;
@@ -193,7 +176,8 @@ body {
 
 #studio-container.tsv-collapsed #tsv-title,
 #studio-container.tsv-collapsed #tsv-meta,
-#studio-container.tsv-collapsed #tsv-rows {
+#studio-container.tsv-collapsed #tsv-rows,
+#studio-container.tsv-collapsed #piano-sound-selector {
   display: none;
 }
 
@@ -207,8 +191,8 @@ body {
   min-height: 36px;
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 0 8px 0 12px;
+  gap: 4px;
+  padding: 0 4px 0 6px;
   border-bottom: 1px solid var(--ui-border);
   background: var(--panel-header);
   color: var(--text-primary);
@@ -365,4 +349,62 @@ input[type="range"][aria-orientation="vertical"]::-moz-range-thumb {
   border: 2px solid #ffffff !important;
   background: var(--accent) !important;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25) !important;
+}
+
+/* TSV editor textarea */
+#tsv-panel {
+  position: relative;
+}
+
+#tsv-rows[style*="display: flex"] {
+  flex: 1;
+  overflow: auto;
+  font-family:
+    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+    monospace;
+  font-size: 12px;
+  line-height: 18px;
+}
+
+#tsv-editor-gutter {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  padding: 8px 4px;
+  background: var(--panel-header);
+  border-right: 1px solid rgba(148, 163, 184, 0.2);
+  user-select: none;
+  min-width: 32px;
+}
+
+.tsv-editor-line-num {
+  height: 18px;
+  padding: 0 6px 0 8px;
+  text-align: right;
+  color: var(--code-line-number);
+  font-size: 11px;
+  line-height: 18px;
+  white-space: nowrap;
+}
+
+#tsv-editor {
+  flex: 1;
+  min-width: 0;
+  height: auto;
+  padding: 8px 12px;
+  border: none;
+  outline: none;
+  resize: none;
+  background: var(--code-bg);
+  color: var(--code-row);
+  font-family:
+    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+    monospace;
+  font-size: 12px;
+  line-height: 18px;
+  tab-size: 4;
+}
+
+#tsv-editor:focus {
+  box-shadow: inset 0 0 0 1px var(--accent);
 }

@@ -23,11 +23,11 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(registration);
   context.subscriptions.push(
     vscode.commands.registerCommand(
-      "wave-roll-studio.exportMidiTsv",
+      "wave-roll-piano.exportMidiTsv",
       exportMidiAsTsv
     ),
     vscode.commands.registerCommand(
-      "wave-roll-studio.exportTsvMidi",
+      "wave-roll-piano.exportTsvMidi",
       exportTsvAsMidi
     )
   );
