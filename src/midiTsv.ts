@@ -63,10 +63,11 @@ const CC_TO_PEDAL = new Map<number, PedalType>([
   [11, "P3"],
 ]);
 
-const MIN_TICK_SCALE = 5;
-const MAX_TICK_SCALE = 50;
-const TARGET_TICK_SCALE_MS = 20;
 const DEFAULT_MICROSECONDS_PER_BEAT = 500000;
+const STANDARD_TPQ = 50;
+const STANDARD_TICK_SCALE = 1;
+const STANDARD_TICK_MS = 10;
+const STANDARD_TEMPO_MICROSECONDS_PER_BEAT = 500000;
 const MIN_SLICE_SECONDS = 10;
 const TARGET_SLICE_SECONDS = 15;
 const MAX_SLICE_SECONDS = 20;
@@ -228,70 +229,84 @@ export function midiToTsv(data: Uint8Array, source = "unknown.mid"): string {
 
   notes.sort(sortTimed);
   pedals.sort(sortTimed);
-  const quantizedPedals = quantizePedalEvents(pedals, PEDAL_VALUE_EPSILON);
   markers.sort(sortTimed);
   tempos.sort(sortTimed);
 
-  const tickScale = selectTickScale(tpq, tempos);
-  const slices = createSlices(notes, quantizedPedals, endTick, tpq, tempos, tickScale);
-  const detectedKey = detectKeyFromNotes(notes);
+  const tempoMap = buildOriginalTempoMap(tpq, tempos);
+  const bakedNotes = bakeNotesToStandardTicks(notes, tempoMap);
+  const bakedPedals = bakePedalsToStandardTicks(pedals, tempoMap);
+  const quantizedPedals = quantizePedalEvents(bakedPedals, PEDAL_VALUE_EPSILON);
+  const bakedMarkers = bakeMarkersToStandardTicks(markers, tempoMap);
+  const bakedTimeSignatures = timeSignatures.map((sig) => ({
+    ...sig,
+    tick: originalTickToStandardTick(sig.tick, tempoMap),
+  }));
+  const bakedKeySignatures = keySignatures.map((key) => ({
+    ...key,
+    tick: originalTickToStandardTick(key.tick, tempoMap),
+  }));
+  const bakedEndTick = Math.max(
+    originalTickToStandardTick(endTick, tempoMap),
+    ...bakedNotes.map((note) => note.t + note.dur),
+    ...quantizedPedals.map((pedal) => pedal.t),
+    ...bakedMarkers.map((marker) => marker.t)
+  );
+  const slices = createSlices(bakedNotes, quantizedPedals, bakedEndTick);
+  const detectedKey = detectKeyFromNotes(bakedNotes);
 
   const lines = [
     "# midi-tsv v0.2",
     `# source=${source}`,
     "# unit=tick",
-    `# tick_scale=${tickScale}`,
-    `# tpq=${tpq}`,
+    `# tick_scale=${STANDARD_TICK_SCALE}`,
+    `# tpq=${STANDARD_TPQ}`,
+    `# tick_ms=${STANDARD_TICK_MS}`,
     "# pitch=abc-absolute",
     `# detected_key=${detectedKey}`,
     `# channel=${defaultChannel}`,
+    `# tempo=0,${STANDARD_TEMPO_MICROSECONDS_PER_BEAT}`,
   ];
 
-  for (const tempo of tempos) {
-    lines.push(`# tempo=${scaleTick(tempo.tick, tickScale)},${tempo.microsecondsPerBeat}`);
-  }
-  for (const sig of timeSignatures) {
+  for (const sig of bakedTimeSignatures) {
     lines.push(
-      `# time_signature=${scaleTick(sig.tick, tickScale)},${sig.numerator},${sig.denominator},${sig.metronome},${sig.thirtyseconds}`
+      `# time_signature=${sig.tick},${sig.numerator},${sig.denominator},${sig.metronome},${sig.thirtyseconds}`
     );
   }
-  for (const key of keySignatures) {
-    lines.push(`# key_signature=${scaleTick(key.tick, tickScale)},${key.key},${key.scale}`);
+  for (const key of bakedKeySignatures) {
+    lines.push(`# key_signature=${key.tick},${key.key},${key.scale}`);
   }
 
   lines.push("");
 
   for (const slice of slices) {
-    const localStart = findSliceLocalStart(notes, quantizedPedals, markers, slice, slices);
+    const localStart = findSliceLocalStart(bakedNotes, quantizedPedals, bakedMarkers, slice, slices);
     const isLast = slice.id === slices.length;
-    const sliceNotes = notes.filter(
+    const sliceNotes = bakedNotes.filter(
       (note) => note.t >= localStart && (note.t < slice.end || isLast)
     );
     const sliceKey = detectKeyFromNotes(sliceNotes) || detectedKey;
 
-    lines.push(
-      `S${slice.id}\t${scaleTick(localStart, tickScale)}\t${scaleTick(slice.end, tickScale)}`
-    );
+    lines.push(`S${slice.id}\t${localStart}\t${slice.end}`);
 
     const records = [
       ...sliceNotes.map((note) => ({
         t: note.t,
         order: 1,
-        line: `${midiPitchToAbcSmart(note.pitch, sliceKey)}${scaleDuration(note.dur, tickScale)}\t${scaleTick(note.t - localStart, tickScale)}\t${note.vel}`,
+        line: `${midiPitchToAbcSmart(note.pitch, sliceKey)}:${note.dur}\t${note.t - localStart}\t${note.vel}`,
       })),
       ...quantizedPedals
         .filter((item) => item.t >= localStart && (item.t < slice.end || isLast))
         .map((pedal) => ({
           t: pedal.t,
           order: 0,
-          line: `${pedal.type}\t${scaleTick(pedal.t - localStart, tickScale)}\t${pedal.val}`,
+          line: `${pedal.type}\t${pedal.t - localStart}\t${pedal.val}`,
         })),
-      ...markers
+      ...bakedMarkers
         .filter((item) => item.t >= localStart && (item.t < slice.end || isLast))
         .map((marker) => ({
           t: marker.t,
           order: 2,
-          line: `M\t${scaleTick(marker.t - localStart, tickScale)}\t${JSON.stringify(marker.text)}`,
+          line: `M\t${marker.t - localStart}\t${JSON.stringify(marker.text)}`,
         })),
     ].sort((a, b) => a.t - b.t || a.order - b.order);
 
@@ -476,6 +491,90 @@ function quantizePedalEvents(pedals: PedalRecord[], epsilon: number): PedalRecor
   return result;
 }
 
+interface TempoPoint {
+  tick: number;
+  seconds: number;
+  microsecondsPerBeat: number;
+  tpq: number;
+}
+
+function buildOriginalTempoMap(
+  tpq: number,
+  tempos: TsvMeta["tempos"]
+): TempoPoint[] {
+  const sorted = [...tempos]
+    .sort((a, b) => a.tick - b.tick)
+    .filter((tempo, index, all) => index === 0 || tempo.tick !== all[index - 1].tick);
+
+  if (sorted.length === 0 || sorted[0].tick !== 0) {
+    sorted.unshift({ tick: 0, microsecondsPerBeat: DEFAULT_MICROSECONDS_PER_BEAT });
+  }
+
+  let seconds = 0;
+  let previous = sorted[0];
+  const points: TempoPoint[] = [
+    { tick: previous.tick, seconds: 0, microsecondsPerBeat: previous.microsecondsPerBeat, tpq },
+  ];
+
+  for (let i = 1; i < sorted.length; i++) {
+    const tempo = sorted[i];
+    seconds +=
+      ((tempo.tick - previous.tick) * previous.microsecondsPerBeat) / tpq / 1_000_000;
+    points.push({ tick: tempo.tick, seconds, microsecondsPerBeat: tempo.microsecondsPerBeat, tpq });
+    previous = tempo;
+  }
+
+  return points;
+}
+
+function originalTickToStandardTick(tick: number, tempoMap: TempoPoint[]): number {
+  let selected = tempoMap[0];
+  for (const point of tempoMap) {
+    if (point.tick <= tick) {
+      selected = point;
+    } else {
+      break;
+    }
+  }
+  const seconds =
+    selected.seconds +
+    ((tick - selected.tick) * selected.microsecondsPerBeat) / selected.tpq / 1_000_000;
+  return Math.round((seconds * 1000) / STANDARD_TICK_MS);
+}
+
+function bakeNotesToStandardTicks(notes: NoteRecord[], tempoMapRaw: TempoPoint[]): NoteRecord[] {
+  const tempoMap = tempoMapRaw;
+  return notes.map((note) => {
+    const start = originalTickToStandardTick(note.t, tempoMap);
+    const end = originalTickToStandardTick(note.t + note.dur, tempoMap);
+    return {
+      ...note,
+      t: start,
+      dur: note.dur > 0 ? Math.max(1, end - start) : 0,
+    };
+  });
+}
+
+function bakePedalsToStandardTicks(
+  pedals: PedalRecord[],
+  tempoMap: TempoPoint[]
+): PedalRecord[] {
+  return pedals.map((pedal) => ({
+    ...pedal,
+    t: originalTickToStandardTick(pedal.t, tempoMap),
+  }));
+}
+
+function bakeMarkersToStandardTicks(
+  markers: MarkerRecord[],
+  tempoMap: TempoPoint[]
+): MarkerRecord[] {
+  return markers.map((marker) => ({
+    ...marker,
+    t: originalTickToStandardTick(marker.t, tempoMap),
+  }));
+}
+
 function findSliceLocalStart(
   notes: NoteRecord[],
   pedals: PedalRecord[],
@@ -493,69 +592,47 @@ function findSliceLocalStart(
   return first === Infinity ? slice.start : first;
 }
 
-function selectTickScale(tpq: number, tempos: TsvMeta["tempos"]): number {
-  const microsecondsPerBeat =
-    tempos.find((t) => t.tick === 0)?.microsecondsPerBeat ??
-    tempos[0]?.microsecondsPerBeat ??
-    DEFAULT_MICROSECONDS_PER_BEAT;
-  const msPerTick = microsecondsPerBeat / tpq / 1000;
-  const rawScale = TARGET_TICK_SCALE_MS / msPerTick;
-  const rounded = Math.round(rawScale / 5) * 5;
-  return clamp(rounded, MIN_TICK_SCALE, MAX_TICK_SCALE);
-}
-
 function createSlices(
   notes: NoteRecord[],
   pedals: PedalRecord[],
-  endTick: number,
-  tpq: number,
-  tempos: TsvMeta["tempos"],
-  tickScale: number
+  endTick: number
 ): SliceRecord[] {
   if (endTick <= 0) {
     return [{ id: 1, start: 0, end: 0 }];
   }
 
-  const microsecondsPerBeat =
-    tempos.find((tempo) => tempo.tick === 0)?.microsecondsPerBeat ??
-    tempos[0]?.microsecondsPerBeat ??
-    DEFAULT_MICROSECONDS_PER_BEAT;
-  const msPerTick = microsecondsPerBeat / tpq / 1000;
-  const macroSeconds = tickScale * msPerTick / 1000;
-  const endMacro = Math.ceil(endTick / tickScale);
-  const minMacro = Math.max(1, Math.round(MIN_SLICE_SECONDS / macroSeconds));
-  const targetMacro = Math.max(minMacro, Math.round(TARGET_SLICE_SECONDS / macroSeconds));
-  const maxMacro = Math.max(targetMacro, Math.round(MAX_SLICE_SECONDS / macroSeconds));
-  const minGapMacro = Math.max(1, Math.round(MIN_GAP_SECONDS / macroSeconds));
-  const cutCandidates = findWeakCutCandidatesMacro(notes, pedals, tickScale, minGapMacro);
+  const tickSeconds = STANDARD_TICK_MS / 1000;
+  const minTicks = Math.max(1, Math.round(MIN_SLICE_SECONDS / tickSeconds));
+  const targetTicks = Math.max(minTicks, Math.round(TARGET_SLICE_SECONDS / tickSeconds));
+  const maxTicks = Math.max(targetTicks, Math.round(MAX_SLICE_SECONDS / tickSeconds));
+  const minGapTicks = Math.max(1, Math.round(MIN_GAP_SECONDS / tickSeconds));
+  const cutCandidates = findWeakCutCandidates(notes, pedals, minGapTicks);
   const slices: SliceRecord[] = [];
-  let startMacro = 0;
+  let startTick = 0;
 
-  while (endMacro - startMacro > maxMacro) {
-    const minCut = startMacro + minMacro;
-    const maxCut = Math.min(startMacro + maxMacro, endMacro);
-    const targetCut = Math.min(startMacro + targetMacro, maxCut);
+  while (endTick - startTick > maxTicks) {
+    const minCut = startTick + minTicks;
+    const maxCut = Math.min(startTick + maxTicks, endTick);
+    const targetCut = Math.min(startTick + targetTicks, maxCut);
     const candidates = cutCandidates.filter((cut) => cut > minCut && cut < maxCut);
     const cut =
       candidates.sort((a, b) => Math.abs(a - targetCut) - Math.abs(b - targetCut))[0] ??
       targetCut;
-    slices.push({ id: slices.length + 1, start: startMacro * tickScale, end: cut * tickScale });
-    startMacro = cut;
+    slices.push({ id: slices.length + 1, start: startTick, end: cut });
+    startTick = cut;
   }
 
-  slices.push({ id: slices.length + 1, start: startMacro * tickScale, end: endTick });
+  slices.push({ id: slices.length + 1, start: startTick, end: endTick });
   return slices;
 }
 
-function findWeakCutCandidatesMacro(
+function findWeakCutCandidates(
   notes: NoteRecord[],
   pedals: PedalRecord[],
-  tickScale: number,
-  minGapMacro: number
+  minGapTicks: number
 ): number[] {
-  const toMacro = (t: number) => Math.round(t / tickScale);
   const intervals = notes
-    .map((note) => ({ start: toMacro(note.t), end: toMacro(note.t + note.dur) }))
+    .map((note) => ({ start: note.t, end: note.t + note.dur }))
     .filter((interval) => interval.end >= interval.start);
 
   let pedalDownTick: number | undefined;
@@ -563,11 +640,10 @@ function findWeakCutCandidatesMacro(
     if (pedal.type !== "P") {
       continue;
     }
-    const mt = toMacro(pedal.t);
     if (pedal.val >= 64 && pedalDownTick === undefined) {
-      pedalDownTick = mt;
+      pedalDownTick = pedal.t;
     } else if (pedal.val < 64 && pedalDownTick !== undefined) {
-      intervals.push({ start: pedalDownTick, end: mt });
+      intervals.push({ start: pedalDownTick, end: pedal.t });
       pedalDownTick = undefined;
     }
   }
@@ -588,7 +664,7 @@ function findWeakCutCandidatesMacro(
   for (let i = 1; i < merged.length; i++) {
     const previousEnd = merged[i - 1].end;
     const nextStart = merged[i].start;
-    if (nextStart - previousEnd >= minGapMacro) {
+    if (nextStart - previousEnd >= minGapTicks) {
       cuts.push(Math.round((previousEnd + nextStart) / 2));
     }
   }
@@ -664,7 +740,7 @@ function abcPitchToMidi(pitch: string): number {
 
 function parseTsvMeta(tsv: string): TsvMeta {
   const meta: TsvMeta = {
-    tpq: 480,
+    tpq: STANDARD_TPQ,
     tickScale: 1,
     version: "v0.2",
     tempos: [],
@@ -727,7 +803,11 @@ function parseTsvMeta(tsv: string): TsvMeta {
 }
 
 function addMetaEvents(events: TimedEvent[], meta: TsvMeta): void {
-  for (const tempo of meta.tempos) {
+  const tempos =
+    meta.tempos.length > 0
+      ? meta.tempos
+      : [{ tick: 0, microsecondsPerBeat: STANDARD_TEMPO_MICROSECONDS_PER_BEAT }];
+  for (const tempo of tempos) {
     events.push({
       tick: tempo.tick,
       order: 0,
@@ -824,11 +904,11 @@ function isAbcPitch(s: string): boolean {
 }
 
 function isNoteRecord(s: string): boolean {
-  return /^[_^=]*[A-Ga-g]['|,]*\d+$/.test(s);
+  return /^[_^=]*[A-Ga-g]['|,]*:?\d+$/.test(s);
 }
 
 function parseNoteRecord(s: string, lineIndex: number): [string, number] {
-  const match = s.match(/^([_^=]*[A-Ga-g]['|,]*)(\d+)$/);
+  const match = s.match(/^([_^=]*[A-Ga-g]['|,]*):?(\d+)$/);
   if (!match) {
     throw new Error(`Line ${lineIndex + 1}: invalid note record "${s}"`);
   }

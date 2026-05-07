@@ -19,10 +19,11 @@ from pathlib import Path
 
 # ── Constants ──────────────────────────────────────────────────────────────
 
-MIN_TICK_SCALE = 5
-MAX_TICK_SCALE = 50
-TARGET_TICK_SCALE_MS = 20  # 1 macro-tick ≈ 20ms at dominant tempo
 DEFAULT_MICROSECONDS_PER_BEAT = 500_000
+STANDARD_TPQ = 50
+STANDARD_TICK_SCALE = 1
+STANDARD_TICK_MS = 10
+STANDARD_TEMPO_MICROSECONDS_PER_BEAT = 500_000
 MIN_SLICE_SECONDS = 10
 TARGET_SLICE_SECONDS = 15
 MAX_SLICE_SECONDS = 20
@@ -303,92 +304,57 @@ def abc_pitch_to_midi(pitch: str) -> int:
     return midi
 
 
-# ── Tick scale selection ───────────────────────────────────────────────────
-
-def select_tick_scale(tpq: int, tempos: list[dict]) -> int:
-    """Auto-select tick_scale so 1 macro-tick ≈ 20ms at the dominant tempo,
-    rounded to nearest multiple of 5."""
-    microseconds_per_beat = DEFAULT_MICROSECONDS_PER_BEAT
-    for t in tempos:
-        if t["tick"] == 0:
-            microseconds_per_beat = t["microseconds_per_beat"]
-            break
-    if not tempos:
-        pass  # use default
-    ms_per_tick = (microseconds_per_beat / tpq) / 1000
-    raw_scale = TARGET_TICK_SCALE_MS / ms_per_tick
-    rounded = round(raw_scale / 5) * 5
-    return max(MIN_TICK_SCALE, min(MAX_TICK_SCALE, rounded))
-
-
 # ── Slicing ────────────────────────────────────────────────────────────────
 
-def _to_macro(t: int, tick_scale: int) -> int:
-    return round(t / tick_scale)
-
-
-def create_slices(
-    notes: list[dict], pedals: list[dict],
-    end_tick: int, tpq: int, tempos: list[dict], tick_scale: int
-) -> list[dict]:
+def create_slices(notes: list[dict], pedals: list[dict], end_tick: int) -> list[dict]:
     if end_tick <= 0:
         return [{"id": 1, "start": 0, "end": 0}]
 
-    microseconds_per_beat = DEFAULT_MICROSECONDS_PER_BEAT
-    for t in tempos:
-        if t["tick"] == 0:
-            microseconds_per_beat = t["microseconds_per_beat"]
-            break
-    ms_per_tick = (microseconds_per_beat / tpq) / 1000
+    tick_seconds = STANDARD_TICK_MS / 1000
+    min_ticks = max(1, round(MIN_SLICE_SECONDS / tick_seconds))
+    target_ticks = max(min_ticks, round(TARGET_SLICE_SECONDS / tick_seconds))
+    max_ticks = max(target_ticks, round(MAX_SLICE_SECONDS / tick_seconds))
+    min_gap_ticks = max(1, round(MIN_GAP_SECONDS / tick_seconds))
 
-    end_macro = _to_macro(end_tick, tick_scale)
-    min_macro = max(1, round(MIN_SLICE_SECONDS / (tick_scale * ms_per_tick / 1000)))
-    target_macro = max(min_macro, round(TARGET_SLICE_SECONDS / (tick_scale * ms_per_tick / 1000)))
-    max_macro = max(target_macro, round(MAX_SLICE_SECONDS / (tick_scale * ms_per_tick / 1000)))
-    min_gap_macro = max(1, round(MIN_GAP_SECONDS / (tick_scale * ms_per_tick / 1000)))
-
-    cut_candidates = _find_weak_cut_candidates(notes, pedals, tick_scale, min_gap_macro)
+    cut_candidates = _find_weak_cut_candidates(notes, pedals, min_gap_ticks)
 
     slices = []
-    start_macro = 0
-    while end_macro - start_macro > max_macro:
-        min_cut = start_macro + min_macro
-        max_cut = min(start_macro + max_macro, end_macro)
-        target_cut = min(start_macro + target_macro, max_cut)
+    start_tick = 0
+    while end_tick - start_tick > max_ticks:
+        min_cut = start_tick + min_ticks
+        max_cut = min(start_tick + max_ticks, end_tick)
+        target_cut = min(start_tick + target_ticks, max_cut)
         candidates = [c for c in cut_candidates if min_cut < c < max_cut]
         cut = min(candidates, key=lambda c: abs(c - target_cut)) if candidates else target_cut
         slices.append({
             "id": len(slices) + 1,
-            "start": start_macro * tick_scale,
-            "end": cut * tick_scale,
+            "start": start_tick,
+            "end": cut,
         })
-        start_macro = cut
+        start_tick = cut
 
     slices.append({
         "id": len(slices) + 1,
-        "start": start_macro * tick_scale,
+        "start": start_tick,
         "end": end_tick,
     })
     return slices
 
 
-def _find_weak_cut_candidates(
-    notes: list[dict], pedals: list[dict], tick_scale: int, min_gap_macro: int
-) -> list[int]:
+def _find_weak_cut_candidates(notes: list[dict], pedals: list[dict], min_gap_ticks: int) -> list[int]:
     intervals = []
     for n in notes:
-        s = _to_macro(n["t"], tick_scale)
-        e = _to_macro(n["t"] + n["dur"], tick_scale)
+        s = n["t"]
+        e = n["t"] + n["dur"]
         if e >= s:
             intervals.append((s, e))
 
     pedal_down_tick = None
     for p in sorted(pedals, key=lambda x: x["t"]):
-        mt = _to_macro(p["t"], tick_scale)
         if p["val"] >= 64 and pedal_down_tick is None:
-            pedal_down_tick = mt
+            pedal_down_tick = p["t"]
         elif p["val"] < 64 and pedal_down_tick is not None:
-            intervals.append((pedal_down_tick, mt))
+            intervals.append((pedal_down_tick, p["t"]))
             pedal_down_tick = None
 
     # Merge intervals
@@ -403,17 +369,13 @@ def _find_weak_cut_candidates(
     cuts = []
     for i in range(1, len(merged)):
         gap = merged[i][0] - merged[i-1][1]
-        if gap >= min_gap_macro:
+        if gap >= min_gap_ticks:
             cuts.append(round((merged[i-1][1] + merged[i][0]) / 2))
 
     # Also check event tick gaps
-    event_ticks = sorted(set(
-        _to_macro(n["t"], tick_scale) for n in notes
-    ) | set(
-        _to_macro(p["t"], tick_scale) for p in pedals
-    ))
+    event_ticks = sorted(set(n["t"] for n in notes) | set(p["t"] for p in pedals))
     for i in range(1, len(event_ticks)):
-        if event_ticks[i] - event_ticks[i-1] >= min_gap_macro:
+        if event_ticks[i] - event_ticks[i-1] >= min_gap_ticks:
             cuts.append(round((event_ticks[i-1] + event_ticks[i]) / 2))
 
     return sorted(set(cuts))
@@ -448,6 +410,69 @@ def scale_tick(tick: int, tick_scale: int) -> int:
 
 def scale_duration(dur: int, tick_scale: int) -> int:
     return max(1, scale_tick(dur, tick_scale)) if dur > 0 else 0
+
+
+def build_original_tempo_map(tpq: int, tempos: list[dict]) -> list[dict]:
+    sorted_tempos = sorted(tempos, key=lambda t: t["tick"])
+    deduped = []
+    for tempo in sorted_tempos:
+        if not deduped or tempo["tick"] != deduped[-1]["tick"]:
+            deduped.append(tempo)
+    if not deduped or deduped[0]["tick"] != 0:
+        deduped.insert(0, {"tick": 0, "microseconds_per_beat": DEFAULT_MICROSECONDS_PER_BEAT})
+
+    seconds = 0.0
+    previous = deduped[0]
+    points = [{
+        "tick": previous["tick"],
+        "seconds": 0.0,
+        "microseconds_per_beat": previous["microseconds_per_beat"],
+        "tpq": tpq,
+    }]
+    for tempo in deduped[1:]:
+        seconds += ((tempo["tick"] - previous["tick"]) * previous["microseconds_per_beat"]) / tpq / 1_000_000
+        points.append({
+            "tick": tempo["tick"],
+            "seconds": seconds,
+            "microseconds_per_beat": tempo["microseconds_per_beat"],
+            "tpq": tpq,
+        })
+        previous = tempo
+    return points
+
+
+def original_tick_to_standard_tick(tick: int, tempo_map: list[dict]) -> int:
+    selected = tempo_map[0]
+    for point in tempo_map:
+        if point["tick"] <= tick:
+            selected = point
+        else:
+            break
+    seconds = selected["seconds"] + (
+        (tick - selected["tick"]) * selected["microseconds_per_beat"]
+    ) / selected["tpq"] / 1_000_000
+    return round((seconds * 1000) / STANDARD_TICK_MS)
+
+
+def bake_notes_to_standard_ticks(notes: list[dict], tempo_map: list[dict]) -> list[dict]:
+    baked = []
+    for note in notes:
+        start = original_tick_to_standard_tick(note["t"], tempo_map)
+        end = original_tick_to_standard_tick(note["t"] + note["dur"], tempo_map)
+        item = dict(note)
+        item["t"] = start
+        item["dur"] = max(1, end - start) if note["dur"] > 0 else 0
+        baked.append(item)
+    return baked
+
+
+def bake_timed_records_to_standard_ticks(records: list[dict], tempo_map: list[dict]) -> list[dict]:
+    baked = []
+    for record in records:
+        item = dict(record)
+        item["t"] = original_tick_to_standard_tick(record["t"], tempo_map)
+        baked.append(item)
+    return baked
 
 
 # ── MIDI → TSV ─────────────────────────────────────────────────────────────
@@ -523,11 +548,27 @@ def midi_to_tsv(data: bytes, source: str = "unknown.mid") -> str:
     # Sort
     notes.sort(key=lambda n: n["t"])
     pedals.sort(key=lambda p: p["t"])
-    pedals = quantize_pedal_events(pedals)
     markers.sort(key=lambda m: m["t"])
 
-    tick_scale = select_tick_scale(tpq, tempos)
-    slices = create_slices(notes, pedals, end_tick, tpq, tempos, tick_scale)
+    tempo_map = build_original_tempo_map(tpq, tempos)
+    notes = bake_notes_to_standard_ticks(notes, tempo_map)
+    pedals = quantize_pedal_events(bake_timed_records_to_standard_ticks(pedals, tempo_map))
+    markers = bake_timed_records_to_standard_ticks(markers, tempo_map)
+    time_sigs = [
+        {**sig, "tick": original_tick_to_standard_tick(sig["tick"], tempo_map)}
+        for sig in time_sigs
+    ]
+    key_sigs = [
+        {**ks, "tick": original_tick_to_standard_tick(ks["tick"], tempo_map)}
+        for ks in key_sigs
+    ]
+    end_tick = max(
+        [original_tick_to_standard_tick(end_tick, tempo_map)]
+        + [n["t"] + n["dur"] for n in notes]
+        + [p["t"] for p in pedals]
+        + [m["t"] for m in markers]
+    )
+    slices = create_slices(notes, pedals, end_tick)
     detected_key = detect_key_from_notes(notes)
 
     # Build output
@@ -535,28 +576,28 @@ def midi_to_tsv(data: bytes, source: str = "unknown.mid") -> str:
         "# midi-tsv v0.2",
         f"# source={source}",
         "# unit=tick",
-        f"# tick_scale={tick_scale}",
-        f"# tpq={tpq}",
+        f"# tick_scale={STANDARD_TICK_SCALE}",
+        f"# tpq={STANDARD_TPQ}",
+        f"# tick_ms={STANDARD_TICK_MS}",
         "# pitch=abc-absolute",
         f"# detected_key={detected_key}",
         f"# channel={default_channel}",
+        f"# tempo=0,{STANDARD_TEMPO_MICROSECONDS_PER_BEAT}",
     ]
 
-    for t in tempos:
-        lines.append(f"# tempo={scale_tick(t['tick'], tick_scale)},{t['microseconds_per_beat']}")
     for sig in time_sigs:
         lines.append(
-            f"# time_signature={scale_tick(sig['tick'], tick_scale)},"
+            f"# time_signature={sig['tick']},"
             f"{sig['numerator']},{sig['denominator']},{sig['metronome']},{sig['thirtyseconds']}"
         )
     for ks in key_sigs:
-        lines.append(f"# key_signature={scale_tick(ks['tick'], tick_scale)},{ks['key']},{ks['scale']}")
+        lines.append(f"# key_signature={ks['tick']},{ks['key']},{ks['scale']}")
 
     lines.append("")
 
     for sl in slices:
         local_start = _find_slice_local_start(notes, pedals, markers, sl, slices)
-        lines.append(f"S{sl['id']}\t{scale_tick(local_start, tick_scale)}\t{scale_tick(sl['end'], tick_scale)}")
+        lines.append(f"S{sl['id']}\t{local_start}\t{sl['end']}")
 
         records = []
         is_last = sl["id"] == len(slices)
@@ -566,21 +607,21 @@ def midi_to_tsv(data: bytes, source: str = "unknown.mid") -> str:
             records.append({
                 "t": n["t"],
                 "order": 1,
-                "line": f"{midi_pitch_to_abc_smart(n['pitch'], slice_key)}{scale_duration(n['dur'], tick_scale)}\t{scale_tick(n['t'] - local_start, tick_scale)}\t{n['vel']}",
+                "line": f"{midi_pitch_to_abc_smart(n['pitch'], slice_key)}:{n['dur']}\t{n['t'] - local_start}\t{n['vel']}",
             })
         for p in pedals:
             if p["t"] >= local_start and (p["t"] < sl["end"] or is_last):
                 records.append({
                     "t": p["t"],
                     "order": 0,
-                    "line": f"{p['type']}\t{scale_tick(p['t'] - local_start, tick_scale)}\t{p['val']}",
+                    "line": f"{p['type']}\t{p['t'] - local_start}\t{p['val']}",
                 })
         for m in markers:
             if m["t"] >= local_start and (m["t"] < sl["end"] or is_last):
                 records.append({
                     "t": m["t"],
                     "order": 2,
-                    "line": f"M\t{scale_tick(m['t'] - local_start, tick_scale)}\t{json.dumps(m['text'])}",
+                    "line": f"M\t{m['t'] - local_start}\t{json.dumps(m['text'])}",
                 })
         records.sort(key=lambda r: (r["t"], r["order"]))
         for r in records:
@@ -724,7 +765,11 @@ def _tsv_v1_to_midi(tsv: str, meta: dict) -> bytes:
 
 
 def _append_meta_events(events: list[dict], meta: dict) -> None:
-    for t in meta["tempos"]:
+    tempos = meta["tempos"] or [{
+        "tick": 0,
+        "microseconds_per_beat": STANDARD_TEMPO_MICROSECONDS_PER_BEAT,
+    }]
+    for t in tempos:
         payload = struct.pack(">I", t["microseconds_per_beat"])[1:]  # 3 bytes
         events.append({
             "tick": t["tick"], "order": 0,
@@ -762,7 +807,7 @@ def _to_delta_events(events: list[dict]) -> list[dict]:
 
 def _parse_tsv_meta(tsv: str) -> dict:
     meta = {
-        "version": "v0.2", "tpq": 480, "tick_scale": 1,
+        "version": "v0.2", "tpq": STANDARD_TPQ, "tick_scale": 1,
         "tempos": [], "time_signatures": [], "key_signatures": [],
         "track_channels": {}, "channel": 0,
     }
@@ -822,11 +867,11 @@ def _is_slice_record(s: str) -> bool:
 
 
 def _is_note_record(s: str) -> bool:
-    return bool(re.match(r"^[_^=]*[A-Ga-g]['|,]*\d+$", s))
+    return bool(re.match(r"^[_^=]*[A-Ga-g]['|,]*:?\d+$", s))
 
 
 def _parse_note_record(s: str, line_idx: int) -> tuple[str, int]:
-    match = re.match(r"^([_^=]*[A-Ga-g]['|,]*)(\d+)$", s)
+    match = re.match(r"^([_^=]*[A-Ga-g]['|,]*):?(\d+)$", s)
     if not match:
         raise ValueError(f"Line {line_idx+1}: invalid note record {s!r}")
     return match.group(1), _parse_non_negative(match.group(2), line_idx)

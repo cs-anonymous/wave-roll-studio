@@ -7,7 +7,7 @@
 1. 文件扩展名：`.tsv`
 2. 统一 3 列格式：`<type> <time> <value>`
 3. 音符使用 note-centric 表示（不使用 note_on/note_off）
-4. 使用 tick_scale 缩放，减少数值大小（1 macro-tick ≈ 20ms）
+4. 使用固定真实时间轴：`PPQ=50`，`120 BPM`，`1 tick = 10ms`
 5. 专注钢琴独奏（单 track，无多音色）
 6. 智能切片，每个 slice 适合 LLM 处理
 
@@ -15,6 +15,7 @@
 
 - **v0.1**：初始版本，支持多 track，4 列格式
 - **v0.2**：简化为单 track，统一 3 列格式，扩展 CC 支持
+- **v0.2 当前实现**：Note 使用 `<pitch>:<dur>`；原 MIDI tempo map / PPQ / tick 会烘焙到固定 `10ms` tick 时间轴
 
 ---
 
@@ -26,23 +27,25 @@
 # midi-tsv v0.2
 # source=example.mid
 # unit=tick
-# tick_scale=20
-# tpq=384
+# tick_scale=1
+# tpq=50
+# tick_ms=10
 # pitch=abc-absolute
 # detected_key=C
+# tempo=0,500000
 
 S1	0	1140
 P	0	127
-C482	0	54
-E469	41	47
-G451	67	42
-C920	0	42
+C:482	0	54
+E:469	41	47
+G:451	67	42
+C:920	0	42
 P	172	0
 M	0	"Intro"
 
 S2	1140	2280
-D420	0	60
-E410	460	63
+D:420	0	60
+E:410	460	63
 ```
 
 ## 2. 统一 3 列格式
@@ -56,7 +59,7 @@ E410	460	63
 | 记录类型 | 第 1 列 | 第 2 列 | 第 3 列 |
 |---------|--------|--------|--------|
 | Slice | `S<id>` | start_tick | end_tick |
-| Note | `<pitch><dur>` | onset_time | velocity |
+| Note | `<pitch>:<dur>` | onset_time | velocity |
 | Sustain Pedal | `P` | time | value (0-127) |
 | Soft Pedal | `P1` | time | value (0-127) |
 | Sostenuto | `P2` | time | value (0-127) |
@@ -90,33 +93,33 @@ S2	1140	2280
 ## Note 记录
 
 ```tsv
-<pitch><dur>	<t>	<vel>
+<pitch>:<dur>	<t>	<vel>
 ```
 
 **示例**：
 ```tsv
-C100	0	60
-E95	50	65
-G200	100	50
-^F150	200	70
-_B80	300	55
+C:100	0	60
+E:95	50	65
+G:200	100	50
+^F:150	200	70
+_B:80	300	55
 ```
 
 **说明**：
-- 第 1 列：pitch 和 duration 直接连接（无分隔符）
+- 第 1 列：pitch 和 duration 使用冒号分隔
 - 第 2 列：onset time（相对于 slice start）
 - 第 3 列：velocity (0-127)
 
 **解析规则**：
 - 匹配 ABC pitch 模式：`^[_^=]*[A-Ga-g]['|,]*`
-- 剩余数字部分为 duration
+- 冒号后的数字部分为 duration
 
 **示例解析**：
 ```
-C100    → pitch="C",    dur=100
-^F150   → pitch="^F",   dur=150
-c'200   → pitch="c'",   dur=200
-G,,80   → pitch="G,,",  dur=80
+C:100    → pitch="C",    dur=100
+^F:150   → pitch="^F",   dur=150
+c':200   → pitch="c'",   dur=200
+G,,:80   → pitch="G,,",  dur=80
 ```
 
 ---
@@ -193,55 +196,23 @@ M	2280	"Chorus"
 
 ---
 
-# Tick Scale 机制
+# 固定时间轴机制
 
-## 为什么需要 tick_scale？
+## 为什么需要固定时间轴？
 
-原始 MIDI 的 tick 数值很大：
-- 典型 `tpq=480`，一个四分音符 = 480 ticks
-- 10 秒音乐可能有 10,000+ ticks
-- 大数值对 LLM 不友好
+Performance MIDI 的 tempo map、PPQ 和 tick 分辨率各不相同。MIDI-TSV 会先把原始 MIDI 的 tick 按 tempo map 转成真实时间，再量化到统一时间轴：
 
-## Tick Scale 原理
+- `tpq = 50`
+- `tempo = 500000`（120 BPM）
+- `tick_scale = 1`
+- `1 tick = 10ms`
 
 ```
-macro_tick = round(original_tick / tick_scale)
+seconds = original_tick_to_seconds(original_tick, original_tempo_map, original_tpq)
+tsv_tick = round(seconds * 1000 / 10)
 ```
 
-**v0.2 默认**：`tick_scale = 20`
-
-目标：**1 macro-tick ≈ 20ms**
-
-## 自动选择算法
-
-```python
-def select_tick_scale(tpq: int, tempos: list[dict]) -> int:
-    # 获取主要 tempo
-    microseconds_per_beat = 500_000  # 默认 120 BPM
-    for t in tempos:
-        if t["tick"] == 0:
-            microseconds_per_beat = t["microseconds_per_beat"]
-            break
-    
-    # 计算每个 tick 对应的毫秒数
-    ms_per_tick = (microseconds_per_beat / tpq) / 1000
-    
-    # 计算需要的缩放比例，使 1 macro-tick ≈ 20ms
-    raw_scale = 20 / ms_per_tick
-    
-    # 四舍五入到最近的 5 的倍数
-    rounded = round(raw_scale / 5) * 5
-    
-    # 限制在 [5, 50] 范围内
-    return max(5, min(50, rounded))
-```
-
-## 实际效果
-
-示例（`tpq=384, tempo=500000, tick_scale=20`）：
-- 原始：1 quarter note = 384 ticks
-- 缩放后：1 quarter note ≈ 19 macro-ticks
-- 时间精度：≈ 26ms per macro-tick
+TSV 中的 `time`、`duration`、slice 边界都使用这个新 tick，不再使用原始 MIDI tick。
 
 ---
 

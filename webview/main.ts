@@ -825,7 +825,7 @@ function parsePositiveNumber(value: string, fallback: number): number {
 }
 
 function parseMidiTsvV2Note(value: string): { pitch: string; dur: number } | null {
-  const match = value.match(/^([_^=]*[A-Ga-g]['|,]*)(\d+)$/);
+  const match = value.match(/^([_^=]*[A-Ga-g]['|,]*):?(\d+)$/);
   if (!match) {
     return null;
   }
