@@ -1,1060 +1,715 @@
-下面给你一个可以直接作为项目规范的 **MIDI-TSV v0.1 设计**。核心原则是：
+# MIDI-TSV 规范
 
-```text
-1. 文件扩展名直接使用 .tsv
-2. 大 TSV = 多个 Slice TSV 的连接体
-3. 每个 Slice 内部用 T block 对应 ABCX 的 [V:1] / [V:2]
-4. 音符使用 note-centric 表示，不使用 note_on / note_off 低层事件
-5. 时间只使用 t / dur，不提前假设 bar / beat / pos
-6. Perform-LM 只处理短 Slice，不直接处理完整 TSV
-```
+**MIDI-TSV** 是一个面向 LLM 的 Performance MIDI 文本中间格式。
 
-这个设计和你 Performance Model 文档里的核心观点一致：Performance MIDI 的价值在于 timing deviation、duration、velocity、pedal、micro-timing 等演奏表达信息，而不是把它过早量化成乐谱网格。
+## 核心原则
 
----
+1. 文件扩展名：`.tsv`
+2. 统一 3 列格式：`<type> <time> <value>`
+3. 音符使用 note-centric 表示（不使用 note_on/note_off）
+4. 使用 tick_scale 缩放，减少数值大小（1 macro-tick ≈ 20ms）
+5. 专注钢琴独奏（单 track，无多音色）
+6. 智能切片，每个 slice 适合 LLM 处理
 
-# MIDI-TSV v0.1 设计
+## 版本历史
 
-## 1. 文件命名
-
-MIDI-TSV 文件直接加上 `.tsv` 后缀。
-
-例如：
-
-```text
-nocturne_001.mid
-→ nocturne_001.mid.tsv
-```
-
-## 2. 设计目标
-
-MIDI-TSV 不是传统 MIDI CSV，也不是 REMI、BPE 或 MusicBERT token。它是一个 **面向 LLM 的 Performance MIDI 文本中间格式**。
-
-它要满足四件事：
-
-|目标|说明|
-|---|---|
-|MIDI 可转 TSV|用固定脚本把 MIDI 转成 TSV|
-|TSV 可转 MIDI|用固定脚本把 TSV 重新渲染成 MIDI|
-|TSV 可切片|一个完整 TSV 内部包含多个 Slice|
-|Slice 可喂 LLM|Perform-LM 每次只处理一个短 Slice|
-
-所以完整流程是：
-
-```text
-MIDI
-→ full .tsv
-→ slice .tsv
-→ Perform-LM
-→ ABCX fragment / MIDI-TSV fragment
-→ merge
-→ full ABCX / full MIDI
-```
+- **v0.1**：初始版本，支持多 track，4 列格式
+- **v0.2**：简化为单 track，统一 3 列格式，扩展 CC 支持
 
 ---
 
-# 3. 文件整体结构
+# 文件格式 (v0.2)
 
-一个完整 `.tsv` 文件由三层组成：
+## 1. 整体结构
 
-```text
-Global Header
-Slice Block 1
-Slice Block 2
-Slice Block 3
-...
+```tsv
+# midi-tsv v0.2
+# source=example.mid
+# unit=tick
+# tick_scale=20
+# tpq=384
+# pitch=abc-absolute
+# detected_key=C
+
+S1	0	1140
+P	0	127
+C482	0	54
+E469	41	47
+G451	67	42
+C920	0	42
+P	172	0
+M	0	"Intro"
+
+S2	1140	2280
+D420	0	60
+E410	460	63
 ```
 
-其中：
+## 2. 统一 3 列格式
 
-```text
-大 TSV = 多个小 Slice TSV 的顺序连接
+所有记录统一为：
+
+```
+<type>	<time>	<value>
 ```
 
-示例：
+| 记录类型 | 第 1 列 | 第 2 列 | 第 3 列 |
+|---------|--------|--------|--------|
+| Slice | `S<id>` | start_tick | end_tick |
+| Note | `<pitch><dur>` | onset_time | velocity |
+| Sustain Pedal | `P` | time | value (0-127) |
+| Soft Pedal | `P1` | time | value (0-127) |
+| Sostenuto | `P2` | time | value (0-127) |
+| Expression | `P3` | time | value (0-127) |
+| Marker | `M` | time | "text" |
 
-```text
+---
+
+# 记录类型详解
+
+## Slice 记录
+
+```tsv
+S<id>	<start_tick>	<end_tick>
+```
+
+**示例**：
+```tsv
+S1	0	1140
+S2	1140	2280
+```
+
+**说明**：
+- `S1` 将 Slice 标识和 ID 直接连接
+- `start_tick` 是该 slice 第一个事件的绝对 tick（macro-tick）
+- `end_tick` 是该 slice 的结束 tick
+- Slice 内所有事件的 time 都是相对于 `start_tick` 的偏移
+
+---
+
+## Note 记录
+
+```tsv
+<pitch><dur>	<t>	<vel>
+```
+
+**示例**：
+```tsv
+C100	0	60
+E95	50	65
+G200	100	50
+^F150	200	70
+_B80	300	55
+```
+
+**说明**：
+- 第 1 列：pitch 和 duration 直接连接（无分隔符）
+- 第 2 列：onset time（相对于 slice start）
+- 第 3 列：velocity (0-127)
+
+**解析规则**：
+- 匹配 ABC pitch 模式：`^[_^=]*[A-Ga-g]['|,]*`
+- 剩余数字部分为 duration
+
+**示例解析**：
+```
+C100    → pitch="C",    dur=100
+^F150   → pitch="^F",   dur=150
+c'200   → pitch="c'",   dur=200
+G,,80   → pitch="G,,",  dur=80
+```
+
+---
+
+## Pedal 记录
+
+### Sustain Pedal (CC64)
+```tsv
+P	<t>	<val>
+```
+
+**示例**：
+```tsv
+P	0	127     # pedal down
+P	500	0      # pedal up
+P	600	64     # half pedal
+```
+
+### Soft Pedal (CC67)
+```tsv
+P1	<t>	<val>
+```
+
+**示例**：
+```tsv
+P1	0	100    # soft pedal down
+P1	500	0     # soft pedal up
+```
+
+### Sostenuto Pedal (CC66)
+```tsv
+P2	<t>	<val>
+```
+
+**示例**：
+```tsv
+P2	100	127   # sostenuto on
+P2	600	0     # sostenuto off
+```
+
+### Expression (CC11)
+```tsv
+P3	<t>	<val>
+```
+
+**示例**：
+```tsv
+P3	0	100    # full expression
+P3	200	60    # reduce expression
+```
+
+**命名规则**：
+- `P` = Sustain Pedal (CC64) - 最常用
+- `P1` = Soft Pedal (CC67)
+- `P2` = Sostenuto (CC66)
+- `P3` = Expression (CC11)
+
+---
+
+## Marker 记录
+
+```tsv
+M	<t>	"<text>"
+```
+
+**示例**：
+```tsv
+M	0	"Intro"
+M	1140	"Verse"
+M	2280	"Chorus"
+```
+
+保留 MIDI 文件中的 marker/cue point，帮助 LLM 理解乐句结构。
+
+---
+
+# Tick Scale 机制
+
+## 为什么需要 tick_scale？
+
+原始 MIDI 的 tick 数值很大：
+- 典型 `tpq=480`，一个四分音符 = 480 ticks
+- 10 秒音乐可能有 10,000+ ticks
+- 大数值对 LLM 不友好
+
+## Tick Scale 原理
+
+```
+macro_tick = round(original_tick / tick_scale)
+```
+
+**v0.2 默认**：`tick_scale = 20`
+
+目标：**1 macro-tick ≈ 20ms**
+
+## 自动选择算法
+
+```python
+def select_tick_scale(tpq: int, tempos: list[dict]) -> int:
+    # 获取主要 tempo
+    microseconds_per_beat = 500_000  # 默认 120 BPM
+    for t in tempos:
+        if t["tick"] == 0:
+            microseconds_per_beat = t["microseconds_per_beat"]
+            break
+    
+    # 计算每个 tick 对应的毫秒数
+    ms_per_tick = (microseconds_per_beat / tpq) / 1000
+    
+    # 计算需要的缩放比例，使 1 macro-tick ≈ 20ms
+    raw_scale = 20 / ms_per_tick
+    
+    # 四舍五入到最近的 5 的倍数
+    rounded = round(raw_scale / 5) * 5
+    
+    # 限制在 [5, 50] 范围内
+    return max(5, min(50, rounded))
+```
+
+## 实际效果
+
+示例（`tpq=384, tempo=500000, tick_scale=20`）：
+- 原始：1 quarter note = 384 ticks
+- 缩放后：1 quarter note ≈ 19 macro-ticks
+- 时间精度：≈ 26ms per macro-tick
+
+---
+
+# Pitch 表示
+
+## ABC Pitch 语法
+
+```
+C, D, E, F, G, A, B     # 低八度
+C  D  E  F  G  A  B     # 中八度 (middle C = C)
+c  d  e  f  g  a  b     # 高八度
+c' d' e' f' g' a' b'    # 更高八度
+^C  _D  =E              # 升、降、还原
+```
+
+## 智能 Pitch Spelling
+
+**问题**：MIDI 只有数字音高（60, 61, 62...），不知道应该写成 `^C` 还是 `_D`。
+
+**解决方案**：基于 slice 音列自动识别调性
+
+### Step 1: 收集音高类
+
+```python
+def collect_pitch_classes(slice_notes):
+    pitch_classes = set()
+    for note in slice_notes:
+        pitch_classes.add(note.midi_pitch % 12)
+    return pitch_classes
+```
+
+### Step 2: 匹配最佳调性
+
+```python
+MAJOR_SCALES = {
+    "C":  [0, 2, 4, 5, 7, 9, 11],
+    "G":  [0, 2, 4, 6, 7, 9, 11],  # F#
+    "D":  [1, 2, 4, 6, 7, 9, 11],  # F#, C#
+    "F":  [0, 2, 4, 5, 7, 9, 10],  # Bb
+    "Bb": [0, 2, 3, 5, 7, 9, 10],  # Bb, Eb
+    "Eb": [0, 2, 3, 5, 7, 8, 10],  # Bb, Eb, Ab
+    "Ab": [0, 1, 3, 5, 7, 8, 10],  # Bb, Eb, Ab, Db
+    "Db": [0, 1, 3, 5, 6, 8, 10],  # all flats
+    # ... 更多调性
+}
+
+def find_best_key(pitch_classes):
+    best_key = "C"
+    best_score = 0
+    
+    for key, scale in MAJOR_SCALES.items():
+        score = len(pitch_classes & set(scale))
+        if score > best_score:
+            best_score = score
+            best_key = key
+    
+    return best_key
+```
+
+### Step 3: 根据调性拼写
+
+```python
+KEY_ACCIDENTALS = {
+    "C":  {},
+    "G":  {6: "^F"},
+    "D":  {6: "^F", 1: "^C"},
+    "F":  {10: "_B"},
+    "Db": {10: "_B", 3: "_E", 8: "_A", 1: "_D", 6: "_G"},
+    # ...
+}
+
+def midi_pitch_to_abc_smart(pitch, key):
+    pitch_class = pitch % 12
+    octave = pitch // 12 - 5
+    
+    if pitch_class in KEY_ACCIDENTALS[key]:
+        spelled = KEY_ACCIDENTALS[key][pitch_class]
+    else:
+        natural_notes = {0:"C", 2:"D", 4:"E", 5:"F", 7:"G", 9:"A", 11:"B"}
+        spelled = natural_notes.get(pitch_class, "C")
+    
+    # 添加八度标记
+    if octave > 0:
+        return f"{spelled.lower()}{'\'' * (octave - 1)}"
+    elif octave < 0:
+        return f"{spelled}{',' * (-octave)}"
+    return spelled
+```
+
+### 效果示例
+
+**输入 MIDI**：`60, 61, 63, 65, 66, 68, 70, 72`
+
+**简单规则**（v0.1）：
+```tsv
+C100	0	60
+^C100	100	60
+^D100	200	60
+F100	300	60
+```
+
+**智能识别**（v0.2，识别为 Db major）：
+```tsv
+# detected_key=Db
+C100	0	60
+_D100	100	60
+_E100	200	60
+F100	300	60
+```
+
+---
+
+# 切片算法
+
+## 切片目标
+
+- 接近乐句边界
+- 长度在合理范围内（10-20 秒）
+- 保留完整的音乐片段
+
+## 切片参数
+
+| 参数 | 值 |
+|-----|---|
+| 最短长度 | 10 秒 |
+| 目标长度 | 15 秒 |
+| 最长长度 | 20 秒 |
+| 最小间隙 | 350ms |
+
+## 智能切点选择
+
+### 寻找候选切点
+
+```python
+def _find_weak_cut_candidates(notes, pedals, tick_scale, min_gap_macro):
+    # 1. 构建音符和踏板的活跃区间
+    intervals = []
+    for note in notes:
+        start = to_macro(note["t"], tick_scale)
+        end = to_macro(note["t"] + note["dur"], tick_scale)
+        intervals.append((start, end))
+    
+    # 2. 踏板按下期间也视为活跃区间
+    pedal_down_tick = None
+    for pedal in sorted(pedals, key=lambda x: x["t"]):
+        mt = to_macro(pedal["t"], tick_scale)
+        if pedal["val"] >= 64 and pedal_down_tick is None:
+            pedal_down_tick = mt
+        elif pedal["val"] < 64 and pedal_down_tick is not None:
+            intervals.append((pedal_down_tick, mt))
+            pedal_down_tick = None
+    
+    # 3. 合并重叠区间
+    intervals.sort()
+    merged = []
+    for start, end in intervals:
+        if not merged or start > merged[-1][1]:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+    
+    # 4. 在间隙中间位置作为候选切点
+    cuts = []
+    for i in range(1, len(merged)):
+        gap = merged[i][0] - merged[i-1][1]
+        if gap >= min_gap_macro:
+            cuts.append(round((merged[i-1][1] + merged[i][0]) / 2))
+    
+    return sorted(set(cuts))
+```
+
+### 贪心切片
+
+```python
+def create_slices(notes, pedals, end_tick, ...):
+    cut_candidates = _find_weak_cut_candidates(...)
+    
+    slices = []
+    start_macro = 0
+    
+    while end_macro - start_macro > max_macro:
+        min_cut = start_macro + min_macro
+        max_cut = min(start_macro + max_macro, end_macro)
+        target_cut = min(start_macro + target_macro, max_cut)
+        
+        # 选择最接近 target_cut 的候选点
+        candidates = [c for c in cut_candidates if min_cut < c < max_cut]
+        cut = min(candidates, key=lambda c: abs(c - target_cut)) if candidates else target_cut
+        
+        slices.append({"id": len(slices)+1, "start": start_macro*tick_scale, "end": cut*tick_scale})
+        start_macro = cut
+    
+    slices.append({"id": len(slices)+1, "start": start_macro*tick_scale, "end": end_tick})
+    return slices
+```
+
+## 优势
+
+- ✅ 避免在音符或踏板活跃期间切断
+- ✅ 优先选择自然的静音点
+- ✅ 保证每个 slice 长度合理
+- ✅ 对 LLM 友好
+
+---
+
+# 完整示例
+
+## v0.1 格式（对比）
+
+```tsv
 # midi-tsv v0.1
 # source=example.mid
 # unit=tick
-# tpq=480
-# pitch=abc-absolute
+# tick_scale=10
+# tpq=384
 # voice_map=T1:V1,T2:V2
 
-S	1	0	3840
+S	1	0	1140
 T	1
 C	0	482	54
 E	41	469	47
-G	67	451	42
 P	20	88
-P	1850	0
 
 T	2
 C,	0	920	42
 G,	965	850	45
-
-S	2	3840	7680
-T	1
-D	0	420	60
-E	460	410	63
-
-T	2
-G,	0	900	44
-C	920	880	46
 ```
 
----
+## v0.2 格式（新设计）
 
-# 4. 基本记录类型
-
-每一行是一个 record。字段之间用 **tab** 分隔。
-
-## 4.1 注释 / 元信息
-
-以 `#` 开头：
-
-```text
-# midi-tsv v0.1
+```tsv
+# midi-tsv v0.2
+# source=example.mid
 # unit=tick
-# tpq=480
+# tick_scale=20
+# tpq=384
 # pitch=abc-absolute
-# voice_map=T1:V1,T2:V2
-```
+# detected_key=C
 
-推荐元信息：
-
-|字段|含义|
-|---|---|
-|`source`|原 MIDI 文件名|
-|`unit`|时间单位，推荐 `tick`|
-|`tpq`|ticks per quarter note|
-|`pitch`|pitch 表示方式|
-|`voice_map`|track 到 ABCX voice 的映射|
-
----
-
-## 4.2 Slice 记录
-
-```text
-S	slice_id	start_tick	end_tick
-```
-
-例如：
-
-```text
-S	1	0	3840
-S	2	3840	7680
-```
-
-含义：
-
-|字段|含义|
-|---|---|
-|`S`|Slice block 开始|
-|`slice_id`|切片编号|
-|`start_tick`|该 slice 在全曲中的开始 tick|
-|`end_tick`|该 slice 在全曲中的结束 tick|
-
-注意：  
-**Slice 内部所有音符的 `t` 都是相对时间，从 0 开始。**
-
-也就是：
-
-```text
-absolute_tick = slice_start_tick + local_t
-```
-
----
-
-## 4.3 Track 切换记录
-
-```text
-T	track_id
-```
-
-例如：
-
-```text
-T	1
-N	0	482	C	54
-N	41	469	E	47
-
-T	2
-N	0	920	C,	42
-```
-
-含义：
-
-```text
-T 1 之后的事件属于 Track 1
-T 2 之后的事件属于 Track 2
-```
-
-`T` 后面跟随的事件可以是 `pitch t dur vel`（音符）或 `P t val`（踏板）。
-
-这和 ABCX 的 voice 很自然对应：
-
-```text
-T	1  → [V:1]
-T	2  → [V:2]
-T	3  → [V:3]
-```
-
-所以可以在 header 写：
-
-```text
-# voice_map=T1:V1,T2:V2,T3:V3
-```
-
----
-
-## 4.4 Note 记录
-
-音符记录以 **ABC 音高**作为第一个字段，不使用 `N` 前缀：
-
-```text
-pitch	t	dur	vel
-```
-
-例如：
-
-```text
-C	0	482	54
-E	41	469	47
-G	67	451	42
-D	965	418	58
-```
-
-含义：
-
-|字段|含义|
-|---|---|
-|`pitch`|ABC-like pitch，作为行标识|
-|`t`|onset time，slice 内相对 tick，从 0 开始|
-|`dur`|duration，tick|
-|`vel`|MIDI velocity，0–127|
-
-这是一种 **note-centric 表示**。  
-一个音符只占一行，不拆成 `note_on` 和 `note_off`。
-
-解析时，如果行的第一个字段符合 ABC 音高格式（`[_^=]*[A-Ga-g]['|,]*`），则视为音符记录。
-
----
-
-## 4.5 Pedal 记录
-
-第一版只保留 sustain pedal 即可：
-
-```text
-P	t	val
-```
-
-例如：
-
-```text
+S1	0	1140
+C482	0	54
+E469	41	47
 P	20	88
-P	1850	0
+C920	0	42
+G850	965	45
+M	0	"Intro"
 ```
 
-含义：
+## 对比
 
-|字段|含义|
-|---|---|
-|`P`|sustain pedal event|
-|`t`|pedal event time|
-|`val`|CC64 value，0–127|
-
-其中：
-
-```text
-P 20 88   = sustain pedal down / half-pedal
-P 1850 0  = sustain pedal up
-```
-
-如果后续要支持更多 CC，可以扩展为：
-
-```text
-C	t	cc	val
-```
-
-例如：
-
-```text
-C	20	64	88
-C	1850	64	0
-C	300	67	70
-```
-
-但第一版建议只用 `P`。
+| 特性 | v0.1 | v0.2 |
+|-----|------|------|
+| 列数 | 4 列（不统一） | 3 列（统一） |
+| Track | 多 track | 单 track |
+| Note 格式 | `C  0  482  54` | `C482  0  54` |
+| Slice 格式 | `S  1  0  1140` | `S1  0  1140` |
+| CC 支持 | 仅 CC64 | CC64/67/66/11 |
+| Marker | 不支持 | 支持 |
+| Pitch Spelling | 简单规则 | 智能识别 |
+| Token 数 | ~100 | ~70 |
 
 ---
 
-## 4.6 Tempo / Meter / Key 记录，可选
+# 转换算法
 
-如果需要保留 tempo、拍号、调号变化，可以用：
+## MIDI → TSV v0.2
 
-```text
-Q	t	bpm
-M	t	meter
-K	t	key
+```python
+def midi_to_tsv_v2(data: bytes, source: str) -> str:
+    tpq, raw_tracks = parse_midi(data)
+    
+    # 1. 合并所有 track
+    all_notes = []
+    all_pedals = []
+    all_markers = []
+    
+    for track_idx, events in enumerate(raw_tracks):
+        tick = 0
+        open_notes = defaultdict(list)
+        
+        for evt in events:
+            tick += evt["delta"]
+            
+            if evt["type"] == "note_on":
+                open_notes[evt["note"]].append({
+                    "t": tick, "pitch": evt["note"], "vel": evt["velocity"]
+                })
+            elif evt["type"] == "note_off":
+                if open_notes[evt["note"]]:
+                    note = open_notes[evt["note"]].pop(0)
+                    note["dur"] = tick - note["t"]
+                    all_notes.append(note)
+            elif evt["type"] == "control_change":
+                cc = evt["controller"]
+                cc_map = {64: "P", 67: "P1", 66: "P2", 11: "P3"}
+                if cc in cc_map:
+                    all_pedals.append({
+                        "type": cc_map[cc], "t": tick, "val": evt["value"]
+                    })
+            elif evt["type"] == "meta" and evt.get("meta_type") == 0x06:
+                all_markers.append({"t": tick, "text": evt.get("text", "")})
+    
+    # 2. 排序
+    all_notes.sort(key=lambda n: n["t"])
+    all_pedals.sort(key=lambda p: p["t"])
+    
+    # 3. 选择 tick_scale
+    tick_scale = select_tick_scale(tpq, tempos)
+    
+    # 4. 切片
+    slices = create_slices(all_notes, all_pedals, end_tick, tpq, tempos, tick_scale)
+    
+    # 5. 为每个 slice 识别调性
+    for sl in slices:
+        slice_notes = [n for n in all_notes if sl["start"] <= n["t"] < sl["end"]]
+        sl["key"] = detect_key_from_notes(slice_notes)
+    
+    # 6. 生成 TSV
+    lines = [
+        "# midi-tsv v0.2",
+        f"# source={source}",
+        f"# unit=tick",
+        f"# tick_scale={tick_scale}",
+        f"# tpq={tpq}",
+        f"# pitch=abc-absolute",
+    ]
+    
+    for sl in slices:
+        local_start = find_slice_local_start(all_notes, all_pedals, all_markers, sl)
+        lines.append(f"S{sl['id']}\t{scale_tick(local_start, tick_scale)}\t{scale_tick(sl['end'], tick_scale)}")
+        
+        # 收集该 slice 的所有事件
+        events = []
+        
+        for n in all_notes:
+            if local_start <= n["t"] < sl["end"]:
+                pitch_abc = midi_pitch_to_abc_smart(n["pitch"], sl["key"])
+                dur_scaled = scale_duration(n["dur"], tick_scale)
+                t_scaled = scale_tick(n["t"] - local_start, tick_scale)
+                events.append({
+                    "t": n["t"],
+                    "line": f"{pitch_abc}{dur_scaled}\t{t_scaled}\t{n['vel']}"
+                })
+        
+        for p in all_pedals:
+            if local_start <= p["t"] < sl["end"]:
+                t_scaled = scale_tick(p["t"] - local_start, tick_scale)
+                events.append({
+                    "t": p["t"],
+                    "line": f"{p['type']}\t{t_scaled}\t{p['val']}"
+                })
+        
+        for m in all_markers:
+            if local_start <= m["t"] < sl["end"]:
+                t_scaled = scale_tick(m["t"] - local_start, tick_scale)
+                events.append({
+                    "t": m["t"],
+                    "line": f"M\t{t_scaled}\t\"{m['text']}\""
+                })
+        
+        events.sort(key=lambda e: e["t"])
+        for e in events:
+            lines.append(e["line"])
+        lines.append("")
+    
+    return "\n".join(lines)
 ```
 
-例如：
+## TSV v0.2 → MIDI
 
-```text
-Q	0	72
-M	0	4/4
-K	0	C
-```
+```python
+def tsv_v2_to_midi(tsv: str) -> bytes:
+    meta = _parse_tsv_meta(tsv)
+    events = []
+    current_slice_start = 0
+    
+    for line_idx, raw_line in enumerate(tsv.splitlines()):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        
+        fields = raw_line.split("\t")
+        record_type = fields[0]
+        
+        if record_type.startswith("S"):
+            # Slice 记录: S1, S2, ...
+            current_slice_start = int(fields[1]) * meta["tick_scale"]
+        
+        elif _is_note_record(record_type):
+            # 解析 pitch 和 duration
+            pitch_abc, dur = _parse_note_record(record_type)
+            dur = dur * meta["tick_scale"]
+            t = int(fields[1]) * meta["tick_scale"]
+            vel = int(fields[2])
+            
+            pitch_midi = abc_pitch_to_midi(pitch_abc)
+            abs_t = current_slice_start + t
+            
+            events.append({
+                "tick": abs_t, "order": 3,
+                "type": "note_on", "channel": 0, "note": pitch_midi, "velocity": vel
+            })
+            events.append({
+                "tick": abs_t + dur, "order": 2,
+                "type": "note_off", "channel": 0, "note": pitch_midi, "velocity": 0
+            })
+        
+        elif record_type in ["P", "P1", "P2", "P3"]:
+            # Pedal 记录
+            t = int(fields[1]) * meta["tick_scale"]
+            val = int(fields[2])
+            abs_t = current_slice_start + t
+            
+            cc_map = {"P": 64, "P1": 67, "P2": 66, "P3": 11}
+            events.append({
+                "tick": abs_t, "order": 1,
+                "type": "control_change", "channel": 0,
+                "controller": cc_map[record_type], "value": val
+            })
+    
+    events.sort(key=lambda e: (e["tick"], e["order"]))
+    delta_events = _to_delta_events(events)
+    return write_midi(meta["tpq"], [delta_events])
 
-但注意：  
-这些只是全局/局部提示，不代表已经进行了小节对齐。
+def _is_note_record(s: str) -> bool:
+    # 匹配 ABC pitch 开头
+    return bool(re.match(r'^[_^=]*[A-Ga-g][\'|,]*\d+$', s))
 
-对于真实 Performance MIDI，不要强行加入：
-
-```text
-bar
-beat
-pos
-MBT
-```
-
-因为这些可能和真实乐谱没有关系。
-
----
-
-# 5. Pitch 表示
-
-## 5.1 使用 ABC-like pitch
-
-你提出“使用 ABC 的 pitch 符号，而不是 MIDI pitch number”，这是合理的。
-
-例如：
-
-```text
-C
-D
-E
-F
-G
-A
-B
-c
-d
-e
-C,
-C,,
-c'
-^F
-_B
-=F
-```
-
-推荐使用 **ABC-like absolute pitch**：
-
-```text
-pitch=abc-absolute
-```
-
-意思是：
-
-> TSV 中的 pitch 是绝对音高拼写，不依赖 key signature 的省略规则。
-
-例如：
-
-```text
-^F
-_B
-=F
-```
-
-直接表示具体音高。
-
-不要让 TSV pitch 依赖上下文，比如：
-
-```text
-K:G
-F
-```
-
-在 ABC 里可能表示 F#，但在 TSV 中最好不要这样。TSV 里 pitch 应该尽量自包含。
-
----
-
-## 5.2 MIDI pitch number 到 ABC pitch 的转换
-
-原始 MIDI 里只有数值音高，例如：
-
-```text
-60
-61
-62
-```
-
-没有告诉你它应该写成：
-
-```text
-^C
-```
-
-还是：
-
-```text
-_D
-```
-
-所以 MIDI → TSV 时，需要一个 pitch spelling 前处理器。
-
-第一版可以用简单规则：
-
-```text
-key=C 时：
-60 → C
-61 → ^C
-62 → D
-63 → ^D
-64 → E
-65 → F
-66 → ^F
-67 → G
-68 → ^G
-69 → A
-70 → ^A
-71 → B
-72 → c
-```
-
-后续可以根据 key、上下文、和声再优化 enharmonic spelling。
-
----
-
-# 6. MIDI → TSV 转换
-
-## 6.1 输入
-
-标准 MIDI 文件：
-
-```text
-example.mid
-```
-
-MIDI 内部通常是：
-
-```text
-Header
-Track 1: delta-time event stream
-Track 2: delta-time event stream
-...
-```
-
-每个 track 内部是事件流，包括：
-
-```text
-note_on
-note_off
-control_change
-tempo
-time_signature
-key_signature
-marker
-...
-```
-
-但 TSV 不直接保存低层事件流，而是转成 note-centric 表示。
-
----
-
-## 6.2 转换步骤
-
-### Step 1：读取 MIDI
-
-读取：
-
-```text
-tpq
-tracks
-tempo events
-time signature events
-key signature events
-note_on / note_off
-control_change
+def _parse_note_record(s: str) -> tuple[str, int]:
+    # 分离 pitch 和 duration
+    match = re.match(r'^([_^=]*[A-Ga-g][\'|,]*)(\d+)$', s)
+    if match:
+        return match.group(1), int(match.group(2))
+    raise ValueError(f"Invalid note record: {s}")
 ```
 
 ---
 
-### Step 2：delta time 转 absolute tick
+# 作为 LLM 输入
 
-MIDI track 内部的时间通常是 delta time。
-
-需要转成绝对 tick：
-
-```text
-abs_tick_i = abs_tick_{i-1} + delta_tick_i
-```
-
----
-
-### Step 3：配对 note_on / note_off
-
-把：
-
-```text
-note_on pitch=60 vel=54 at tick=0
-note_off pitch=60 at tick=482
-```
-
-转成：
-
-```text
-C	0	482	54
-```
-
-即：
-
-```text
-pitch = midi_pitch_to_abc_pitch(60)
-t = note_on_tick
-dur = note_off_tick - note_on_tick
-vel = note_on_velocity
-```
-
-注意：
-
-```text
-note_on velocity=0
-```
-
-在 MIDI 中通常也表示 note_off。
-
----
-
-### Step 4：处理 pedal
-
-把 sustain pedal CC64 转成：
-
-```text
-P	t	val
-```
-
-例如：
-
-```text
-control_change cc=64 value=88 tick=20
-→ P	20	88
-```
-
-第一版只保留 CC64 即可。
-
----
-
-### Step 5：生成初始完整事件表
-
-此时每个 track 得到：
-
-```text
-T	1
-N	...
-P	...
-
-T	2
-N	...
-P	...
-```
-
----
-
-### Step 6：切片
-
-切片之后，大 TSV 写成多个 `S block`：
-
-```text
-S	1	start	end
-T	1
-...
-T	2
-...
-
-S	2	start	end
-T	1
-...
-T	2
-...
-```
-
-每个 Slice 内部的 `t` 改成相对时间：
-
-```text
-local_t = absolute_tick - slice_start_tick
-```
-
----
-
-# 7. TSV → MIDI 转换
-
-## 7.1 输入
-
-```text
-example.tsv
-```
-
----
-
-## 7.2 转换步骤
-
-### Step 1：读取 header
-
-读取：
-
-```text
-unit=tick
-tpq=480
-pitch=abc-absolute
-```
-
----
-
-### Step 2：逐个 Slice 解析
-
-遇到：
-
-```text
-S	2	3840	7680
-```
-
-记录：
-
-```text
-current_slice_start = 3840
-```
-
----
-
-### Step 3：逐个 Track 解析
-
-遇到：
-
-```text
-T	1
-```
-
-记录：
-
-```text
-current_track = 1
-```
-
----
-
-### Step 4：还原 note_on / note_off
-
-对于：
-
-```text
-N	460	410	E	63
-```
-
-计算：
-
-```text
-pitch = "E"
-abs_on = current_slice_start + 460
-abs_off = abs_on + 410
-pitch_number = abc_pitch_to_midi("E")
-velocity = 63
-```
-
-生成：
-
-```text
-note_on  tick=abs_on  pitch=64 velocity=63
-note_off tick=abs_off pitch=64 velocity=0
-```
-
----
-
-### Step 5：还原 pedal
-
-对于：
-
-```text
-P	20	88
-```
-
-生成：
-
-```text
-control_change tick=current_slice_start+20 cc=64 value=88
-```
-
----
-
-### Step 6：按 track 聚合并排序
-
-每个 track 内部按照绝对 tick 排序。
-
-如果同一 tick 有多个事件，建议顺序为：
-
-```text
-tempo / meter / key
-pedal
-note_off
-note_on
-```
-
-或者更保守：
-
-```text
-note_off before note_on
-```
-
-避免同 pitch 重叠时出错。
-
----
-
-### Step 7：absolute tick 转 delta time
-
-MIDI 写出时需要 delta time：
-
-```text
-delta_i = abs_tick_i - abs_tick_{i-1}
-```
-
----
-
-### Step 8：写出 MIDI
-
-根据：
-
-```text
-tpq
-tracks
-events
-```
-
-写出：
-
-```text
-example.reconstructed.mid
-```
-
-注意：  
-这个转换是 **musically reversible**，不保证 byte-level 完全一致。
-
-也就是说，它可以保留：
-
-```text
-notes
-durations
-velocities
-pedal events
-track structure
-tempo / meter / key metadata
-```
-
-但不一定保留：
-
-```text
-原始 running status
-某些 text meta event
-DAW 私有事件
-原始事件排序的全部细节
-```
-
----
-
-# 8. MIDI 切成很多小段的方法
-
-## 8.1 切片目标
-
-切片不是按小节切，因为真实 MIDI 可能根本没有可靠小节线。
-
-切片目标应该是：
-
-```text
-接近乐句
-但有长度上限
-并且保留多 track 同一时间窗口
-```
-
-也就是说：
-
-```text
-不要：每个 track 单独切
-推荐：按全局时间切，每个 slice 内部保留所有 T block
-```
-
----
-
-## 8.2 切片基本原则
-
-每个 Slice 应该满足：
-
-|约束|建议|
-|---|---|
-|最短长度|3–5 秒等价 tick|
-|目标长度|5–15 秒|
-|最长长度|20 秒左右|
-|note 数上限|80–160 个 note|
-|track|保留该时间窗口内所有 track|
-|时间|slice 内 `t` 从 0 开始|
-
-如果使用 tick 而不是秒，可以通过 tempo 粗略换算。  
-例如 `tpq=480, qpm=120` 时：
-
-```text
-1 beat = 480 tick
-1 second = 960 tick
-10 seconds ≈ 9600 tick
-```
-
----
-
-## 8.3 候选切点
-
-优先选择乐句边界，但第一版可以用启发式。
-
-### 优先级 1：MIDI 自带 marker
-
-如果有：
-
-```text
-marker
-cue point
-track name section
-text event
-```
-
-例如：
-
-```text
-Intro
-Verse
-Chorus
-A
-B
-```
-
-可以作为候选切点。
-
----
-
-### 优先级 2：全局静音点
-
-寻找所有 track 同时接近静音的位置：
-
-```text
-相邻 note onset 间隔很大
-所有 note 已经结束
-sustain pedal 已释放
-```
-
-例如：
-
-```text
-global_gap > 960 tick
-```
-
-或换算成：
-
-```text
-gap > 800ms / 1000ms / 1500ms
-```
-
-这通常接近乐句边界。
-
----
-
-### 优先级 3：低密度点
-
-如果没有明显静音，可以找 note density 低的位置：
-
-```text
-某个时间附近 note 数较少
-velocity 收束
-长音结束
-踏板释放
-```
-
-这不一定是乐句边界，但比强行等长切好。
-
----
-
-### 优先级 4：长度上限强制切
-
-如果超过最长长度还没有好切点，就强制切：
-
-```text
-当前 slice 长度 > max_len
-→ 在最近的低密度点切
-→ 如果没有低密度点，就直接切
-```
-
----
-
-## 8.4 切片算法
-
-伪流程：
-
-```text
-Input: full note events sorted by absolute tick
-
-1. 设定 min_len, target_len, max_len
-2. 从 start=0 开始
-3. 在 [start+min_len, start+max_len] 中寻找候选切点
-4. 优先选择最接近 target_len 的 phrase-like boundary
-5. 如果没有候选点，选择 start+target_len 或 start+max_len
-6. 得到 end
-7. 生成 Slice(start, end)
-8. start=end，继续
-```
-
----
-
-## 8.5 音符跨 Slice 怎么办？
-
-采用最简单规则：
-
-> 音符属于其 onset 所在的 Slice。
-
-例如：
-
-```text
-Slice 1: 0–3840
-N absolute_t=3600 dur=800
-```
-
-这个音符虽然延续到 4400，但它仍然放在 Slice 1：
-
-```text
-S	1	0	3840
-T	1
-C	3600	800	60
-```
-
-不要为了边界把音符强行切断。
-
-踏板也一样：
-
-```text
-P absolute_t=3500 val=88
-```
-
-属于 Slice 1。
-
-后续如果需要，可以在 LLM 输入中加 overlap context，但存储格式第一版不要复杂化。
-
----
-
-# 9. 大 TSV 与小 TSV 的关系
-
-完整大 TSV：
-
-```text
-piece.tsv
-```
-
-本质上是：
-
-```text
-slice_001.tsv
-+ slice_002.tsv
-+ slice_003.tsv
-+ ...
-```
-
-所以：
-
-```text
-大 TSV = 多个 S block 的连接
-小 TSV = 单个 S block
-```
-
-从大 TSV 抽出一个小 TSV 时，只需取对应 `S block`。
-
-例如大 TSV：
-
-```text
-S	2	3840	7680
-T	1
-D	0	420	60
-E	460	410	63
-
-T	2
-G,	0	900	44
-C	920	880	46
-```
-
-抽成 LLM 输入：
-
-```text
-<PMIDI>
-# unit=tick
-# tpq=480
-# pitch=abc-absolute
-# voice_map=T1:V1,T2:V2
-
-S	2	3840	7680
-T	1
-D	0	420	60
-E	460	410	63
-
-T	2
-G,	0	900	44
-C	920	880	46
-</PMIDI>
-```
-
----
-
-# 10. 作为 LLM 输入
-
-## 10.1 MIDI-TSV → ABCX
-
-输入模板：
+## MIDI-TSV → ABCX
 
 ```text
 你是 Perform-LM。请将下面的 MIDI-TSV slice 还原为 ABCX 片段。
 
 要求：
-1. 根据音符时间关系推断节奏和小节线。
-2. 不要把微小 timing deviation 当成复杂节奏。
-3. T1 对应 [V:1]，T2 对应 [V:2]。
-4. 只输出 ABCX，不要解释。
+1. 根据音符时间关系推断节奏和小节线
+2. 不要把微小 timing deviation 当成复杂节奏
+3. 只输出 ABCX，不要解释
 
 <MIDI-TSV>
 # unit=tick
-# tpq=480
-# pitch=abc-absolute
-# voice_map=T1:V1,T2:V2
+# tick_scale=20
+# tpq=384
+# detected_key=C
 
-S	2	3840	7680
-T	1
-D	0	420	60
-E	460	410	63
-
-T	2
-G,	0	900	44
-C	920	880	46
+S1	0	1140
+D420	0	60
+E410	460	63
+G900	0	44
+C880	920	46
 </MIDI-TSV>
 ```
 
-输出：
-
-```abc
-<ABCX>
-[V:1] D E ...
-[V:2] G, C ...
-</ABCX>
-```
-
----
-
-## 10.2 ABCX → MIDI-TSV
-
-输入模板：
+## ABCX → MIDI-TSV
 
 ```text
-你是 Perform-LM。请将下面的 ABCX 片段演奏化为 MIDI-TSV slice。
+你是 Perform-LM。请将下面的 ABCX 片段演奏化为 MIDI-TSV。
 
 演奏要求：
 - 旋律稍微突出
@@ -1063,178 +718,93 @@ C	920	880	46
 - 踏板自然
 
 要求：
-1. 使用 MIDI-TSV v0.1。
-2. 使用 tick 时间，tpq=480。
-3. 使用 ABC-like pitch。
-4. 不要输出解释。
+1. 使用 MIDI-TSV v0.2
+2. 使用 tick_scale=20
+3. 不要输出解释
 
 <ABCX>
 M:4/4
 L:1/8
 K:C
-[V:1] C D E F
-[V:2] C,2 G,2
+C D E F | G2 A2 |
 </ABCX>
 ```
 
 输出：
 
-```text
+```tsv
 <MIDI-TSV>
+# midi-tsv v0.2
 # unit=tick
-# tpq=480
-# pitch=abc-absolute
-# voice_map=T1:V1,T2:V2
+# tick_scale=20
+# tpq=384
 
-S	1	0	3840
-T	1
-N	0	455	C	68
-N	485	430	D	70
-N	970	440	E	72
-N	1465	460	F	69
-
-T	2
-N	0	900	C,	45
-N	965	880	G,	43
+S1	0	200
+C23	0	68
+D22	24	70
+E23	49	72
+F24	75	69
+G46	100	75
+A45	150	73
 P	0	80
-P	1800	0
+P	180	0
 </MIDI-TSV>
 ```
 
 ---
 
-## 10.3 MIDI-TSV → 演奏分析
+# 优势总结
 
-输入：
+## 相比 v0.1
 
-```text
-请分析下面 MIDI-TSV slice 的演奏特点，重点分析 timing、velocity、articulation 和 pedal。
+| 特性 | v0.1 | v0.2 | 改进 |
+|-----|------|------|------|
+| 列数 | 4 列 | 3 列 | ✅ 更简洁 |
+| Track | 多 track | 单 track | ✅ 专注钢琴 |
+| Note 格式 | `C  0  482  54` | `C482  0  54` | ✅ 更紧凑 |
+| CC 支持 | CC64 | CC64/67/66/11 | ✅ 表现力↑ |
+| Pitch Spelling | 简单规则 | 智能识别 | ✅ 音乐理论↑ |
+| Marker | ❌ | ✅ | ✅ 结构清晰 |
+| Token 效率 | 100% | 70% | ✅ 节省 30% |
 
-<MIDI-TSV>
-...
-</MIDI-TSV>
-```
+## 对 LLM 的优势
 
-输出：
-
-```text
-这段演奏中，T1 的前三个音存在轻微错开，形成类似琶音化的和弦进入……
-```
-
----
-
-# 11. SFT 数据格式
-
-如果用官方 LoRA SFT，可以用 ChatML / JSONL。  
-MIDI-TSV 本身就是普通文本，不需要创建新 tokenizer。
-
-示例：
-
-```json
-{
-  "messages": [
-    {
-      "role": "system",
-      "content": "你是 Perform-LM，负责 MIDI-TSV 与 ABCX 之间的短片段转换。"
-    },
-    {
-      "role": "user",
-      "content": "请将下面的 MIDI-TSV slice 还原为 ABCX。只输出 ABCX。\n\n<MIDI-TSV>\n# unit=tick\n# tpq=480\n# pitch=abc-absolute\n# voice_map=T1:V1,T2:V2\n\nS\t2\t3840\t7680\nT\t1\nN\t0\t420\tD\t60\nN\t460\t410\tE\t63\n\nT\t2\nN\t0\t900\tG,\t44\nN\t920\t880\tC\t46\n</MIDI-TSV>"
-    },
-    {
-      "role": "assistant",
-      "content": "<ABCX>\n[V:1] D E ...\n[V:2] G, C ...\n</ABCX>"
-    }
-  ]
-}
-```
+1. ✅ **统一格式**：3 列，降低解析复杂度
+2. ✅ **语义清晰**：`C482` 直观表示"C 音持续 482 ticks"
+3. ✅ **无需声部推理**：所有音符在同一时间线
+4. ✅ **调性提示**：`detected_key` 帮助理解和声
+5. ✅ **结构标记**：Marker 提供乐句边界
+6. ✅ **粗量化**：tick_scale=20，数值更小
 
 ---
 
-# 12. Verifier
+# 实现计划
 
-LLM 输出后必须经过校验。
+## Phase 1: 核心功能（1 周）
+- [ ] 实现 3 列统一格式
+- [ ] 移除 Track 支持
+- [ ] Note 格式改为 `pitch+dur`（无分隔符）
+- [ ] Slice 格式改为 `S:id`
+- [ ] 调整 tick_scale 默认值为 20
 
-## 12.1 MIDI-TSV 校验
+## Phase 2: 扩展 CC（3 天）
+- [ ] 支持 CC67 (soft pedal) → `U`
+- [ ] 支持 CC66 (sostenuto) → `O`
+- [ ] 支持 CC11 (expression) → `X`
 
-检查：
+## Phase 3: 智能 Pitch Spelling（1 周）
+- [ ] 实现调性识别算法
+- [ ] 基于调性的音高拼写
+- [ ] 测试不同调性
 
-```text
-N 行字段数是否正确
-t / dur 是否为非负整数
-vel 是否在 0–127
-pitch 是否能解析
-P value 是否在 0–127
-Slice 内 t 是否大致在范围内
-T block 是否存在
-```
+## Phase 4: Marker 支持（2 天）
+- [ ] 解析 MIDI marker
+- [ ] 输出到 TSV
+- [ ] TSV → MIDI 还原
 
-## 12.2 ABCX 校验
+## Phase 5: 测试（3 天）
+- [ ] 大量 MIDI 文件测试
+- [ ] 与 v0.1 对比
+- [ ] 性能优化
 
-检查：
-
-```text
-是否能 parse
-[V:n] 是否和 Tn 对应
-小节线是否合理
-时值是否能闭合
-pitch 是否合法
-是否能 render
-```
-
-如果不通过：
-
-```text
-Verifier 报错
-→ 把错误报告 + 原始输出返回给 Perform-LM
-→ 重新生成该 Slice
-```
-
-不需要单独 Repair Agent，Generator / Perform-LM 本身可以根据错误报告返修。
-
----
-
-# 13. 最终推荐规范摘要
-
-最终 MIDI-TSV v0.1 可以固定成：
-
-```text
-# midi-tsv v0.1
-# source=<source.mid>
-# unit=tick
-# tick_scale=<scale>
-# tpq=<ticks_per_quarter>
-# pitch=abc-absolute
-# voice_map=T1:V1,T2:V2,...
-
-S	<slice_id>	<start_tick>	<end_tick>
-T	<track_id>
-<pitch>	<t>	<dur>	<vel>
-P	<t>	<val>
-
-S	<slice_id>	<start_tick>	<end_tick>
-T	<track_id>
-<pitch>	<t>	<dur>	<vel>
-...
-```
-
-其中：
-- `start_tick` 是该 slice 中**第一个事件**的绝对 tick，内部所有 `t` 从此处开始（即首个音符的 `t=0`）
-- 音符记录不使用 `N` 前缀，以 ABC 音高作为行标识
-- 相邻 slice 的 `start_tick` 之间可能有空隙，空隙中的音符归入前一个 slice（onset 所在 slice）
-
-完整系统：
-
-```text
-MIDI
-→ MIDI-TSV full file: piece.tsv
-→ Slice blocks: S1, S2, S3...
-→ Perform-LM processes one S block at a time
-→ Output ABCX fragments or MIDI-TSV fragments
-→ Composer / script merges fragments
-→ Full ABCX or reconstructed MIDI
-```
-
-一句话概括：
-
-> **MIDI-TSV 是 Performance MIDI 的 note-centric、slice-aware、LLM-friendly 文本中间格式；完整 `.tsv` 文件由多个 Slice block 组成，LLM 每次只处理一个 Slice block。**
+**总计**：约 2-3 周

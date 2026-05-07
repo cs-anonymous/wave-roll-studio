@@ -61,7 +61,7 @@ let tsvEditor: HTMLTextAreaElement | null = null;
 interface TsvRow {
   lineNumber: number;
   raw: string;
-  type: "S" | "T" | "N" | "P" | "meta" | "blank" | "other";
+  type: "S" | "T" | "N" | "P" | "M" | "meta" | "blank" | "other";
   absTick?: number;
   durTick?: number;
   trackId?: number;
@@ -678,6 +678,18 @@ function parseTsvIndex(tsv: string): TsvIndex {
     }
 
     const fields = raw.split("\t");
+    if (/^S\d+$/.test(fields[0]) && fields.length >= 3) {
+      currentSliceStart = Number(fields[1]) * tickScale;
+      endTick = Math.max(endTick, Number(fields[2]) * tickScale);
+      rows.push({
+        lineNumber,
+        raw,
+        type: "S",
+        absTick: currentSliceStart,
+      });
+      return;
+    }
+
     if (fields[0] === "S" && fields.length >= 4) {
       currentSliceStart = Number(fields[2]) * tickScale;
       endTick = Math.max(endTick, Number(fields[3]) * tickScale);
@@ -693,6 +705,23 @@ function parseTsvIndex(tsv: string): TsvIndex {
     if (fields[0] === "T" && fields.length >= 2) {
       currentTrackId = Number(fields[1]);
       rows.push({ lineNumber, raw, type: "T", trackId: currentTrackId });
+      return;
+    }
+
+    const v2Note = parseMidiTsvV2Note(fields[0]);
+    if (v2Note && fields.length >= 3) {
+      const absTick = currentSliceStart + Number(fields[1]) * tickScale;
+      const durTick = v2Note.dur * tickScale;
+      endTick = Math.max(endTick, absTick + durTick);
+      rows.push({
+        lineNumber,
+        raw,
+        type: "N",
+        absTick,
+        durTick,
+        trackId: currentTrackId,
+        pitch: v2Note.pitch,
+      });
       return;
     }
 
@@ -712,12 +741,24 @@ function parseTsvIndex(tsv: string): TsvIndex {
       return;
     }
 
-    if (fields[0] === "P" && fields.length >= 3) {
+    if (/^P[123]?$/.test(fields[0]) && fields.length >= 3) {
       const absTick = currentSliceStart + Number(fields[1]) * tickScale;
       rows.push({
         lineNumber,
         raw,
         type: "P",
+        absTick,
+        trackId: currentTrackId,
+      });
+      return;
+    }
+
+    if (fields[0] === "M" && fields.length >= 3) {
+      const absTick = currentSliceStart + Number(fields[1]) * tickScale;
+      rows.push({
+        lineNumber,
+        raw,
+        type: "M",
         absTick,
         trackId: currentTrackId,
       });
@@ -781,6 +822,14 @@ function buildTempoMap(
 function parsePositiveNumber(value: string, fallback: number): number {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseMidiTsvV2Note(value: string): { pitch: string; dur: number } | null {
+  const match = value.match(/^([_^=]*[A-Ga-g]['|,]*)(\d+)$/);
+  if (!match) {
+    return null;
+  }
+  return { pitch: match[1], dur: Number(match[2]) };
 }
 
 function tickToSeconds(tick: number): number {

@@ -34,6 +34,9 @@ pnpm-lock.yaml
 # Build artifacts
 *.map
 *.tsbuildinfo
+__pycache__/**
+**/__pycache__/**
+*.pyc
 
 # Misc
 *.md
