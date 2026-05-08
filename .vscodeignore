@@ -41,5 +41,6 @@ __pycache__/**
 # Misc
 *.md
 !README.md
+!MIDI-TSV.md
 .eslintrc*
 .prettierrc*

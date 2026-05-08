@@ -7,6 +7,7 @@ Usage:
     python midi_tsv.py tsv2midi <input.tsv>         # creates <input>.mid
     python midi_tsv.py midi2tsv <input.mid> --out <path>
     python midi_tsv.py tsv2midi <input.tsv> --out <path>
+    python midi_tsv.py midi2tsv <input.mid> --annotation <annotation.txt>  # measure-based
 """
 
 import argparse
@@ -25,9 +26,9 @@ STANDARD_TICK_SCALE = 1
 STANDARD_TICK_MS = 10
 STANDARD_TEMPO_MICROSECONDS_PER_BEAT = 500_000
 MIN_SLICE_SECONDS = 10
-TARGET_SLICE_SECONDS = 15
-MAX_SLICE_SECONDS = 20
-MIN_GAP_SECONDS = 0.35
+TARGET_SLICE_SECONDS = 20
+MAX_SLICE_SECONDS = 30
+MIN_GAP_SECONDS = 0.5
 PEDAL_VALUE_EPSILON = 3
 
 PITCH_CLASSES = [
@@ -304,6 +305,110 @@ def abc_pitch_to_midi(pitch: str) -> int:
     return midi
 
 
+# ── Annotation parsing ─────────────────────────────────────────────────────
+
+def parse_annotation_file(annotation_path: str) -> dict:
+    """Parse annotation file and return downbeats, beats, and time signature info.
+
+    Returns:
+        {
+            "downbeats": [(time_seconds, time_signature), ...],
+            "beats": [time_seconds, ...],
+        }
+    """
+    downbeats = []
+    beats = []
+
+    with open(annotation_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split('\t')
+
+            # Handle both formats:
+            # Format 1: line_num \t time \t time \t label
+            # Format 2: time \t time \t label
+            if len(parts) >= 3:
+                # Try to determine format by checking if first field is a number (line number)
+                try:
+                    int(parts[0])
+                    # Format 1: has line number
+                    if len(parts) >= 4:
+                        time_sec = float(parts[1])
+                        label = parts[3]
+                    else:
+                        continue
+                except ValueError:
+                    # Format 2: no line number, first field is time
+                    time_sec = float(parts[0])
+                    label = parts[2]
+
+                if label.startswith('db'):
+                    # Parse time signature if present (e.g., "db,2/4,0")
+                    time_sig = None
+                    if ',' in label:
+                        sig_parts = label.split(',')
+                        if len(sig_parts) >= 2:
+                            time_sig = sig_parts[1]  # e.g., "2/4"
+                    downbeats.append((time_sec, time_sig))
+                elif label == 'b':
+                    beats.append(time_sec)
+
+    return {
+        "downbeats": downbeats,
+        "beats": beats,
+    }
+
+
+def create_measures_from_annotation(annotation_data: dict, tempo_map: list[dict]) -> list[dict]:
+    """Create measure slices from annotation downbeats.
+
+    Returns list of measures: [{"id": 1, "start": tick, "end": tick, "time_sig": "4/4"}, ...]
+    """
+    downbeats = annotation_data["downbeats"]
+    if not downbeats:
+        return []
+
+    measures = []
+    for i, (time_sec, time_sig) in enumerate(downbeats):
+        start_tick = _seconds_to_standard_tick(time_sec, tempo_map)
+
+        # End tick is the start of next measure, or we'll set it later
+        if i + 1 < len(downbeats):
+            end_tick = _seconds_to_standard_tick(downbeats[i + 1][0], tempo_map)
+        else:
+            end_tick = None  # Will be set to end of piece
+
+        measures.append({
+            "id": i + 1,
+            "start": start_tick,
+            "end": end_tick,
+            "time_sig": time_sig,
+        })
+
+    return measures
+
+
+def _seconds_to_standard_tick(seconds: float, tempo_map: list[dict]) -> int:
+    """Convert seconds to standard ticks using tempo map."""
+    # Find the tempo point that applies at this time
+    selected = tempo_map[0]
+    for point in tempo_map:
+        if point["seconds"] <= seconds:
+            selected = point
+        else:
+            break
+
+    # Calculate ticks from the selected tempo point
+    delta_seconds = seconds - selected["seconds"]
+    delta_ticks_original = (delta_seconds * 1_000_000 * selected["tpq"]) / selected["microseconds_per_beat"]
+    tick_original = selected["tick"] + delta_ticks_original
+
+    # Convert to standard ticks
+    return original_tick_to_standard_tick(int(tick_original), tempo_map)
+
+
 # ── Slicing ────────────────────────────────────────────────────────────────
 
 def create_slices(notes: list[dict], pedals: list[dict], end_tick: int) -> list[dict]:
@@ -342,46 +447,81 @@ def create_slices(notes: list[dict], pedals: list[dict], end_tick: int) -> list[
 
 
 def _find_weak_cut_candidates(notes: list[dict], pedals: list[dict], min_gap_ticks: int) -> list[int]:
-    intervals = []
+    """Find candidate cut points where there's a strong sense of ending.
+
+    A good cut point should have:
+    1. No notes currently sounding (all notes have ended)
+    2. A gap before the next note starts
+    3. Preferably after pedal release
+    """
+    # Build intervals for when notes are sounding
+    note_intervals = []
     for n in notes:
         s = n["t"]
         e = n["t"] + n["dur"]
-        if e >= s:
-            intervals.append((s, e))
+        if e > s:
+            note_intervals.append((s, e))
 
+    # Build intervals for when pedal is down (sustaining sound)
+    pedal_intervals = []
     pedal_down_tick = None
     for p in sorted(pedals, key=lambda x: x["t"]):
         if p["val"] >= 64 and pedal_down_tick is None:
             pedal_down_tick = p["t"]
         elif p["val"] < 64 and pedal_down_tick is not None:
-            intervals.append((pedal_down_tick, p["t"]))
+            pedal_intervals.append((pedal_down_tick, p["t"]))
             pedal_down_tick = None
 
-    # Merge intervals
-    intervals.sort()
+    # Combine note and pedal intervals to find when sound is active
+    all_intervals = note_intervals + pedal_intervals
+    all_intervals.sort()
+
+    # Merge overlapping intervals
     merged = []
-    for s, e in intervals:
+    for s, e in all_intervals:
         if not merged or s > merged[-1][1]:
             merged.append([s, e])
         else:
             merged[-1][1] = max(merged[-1][1], e)
 
+    # Find gaps between merged intervals (silence periods)
     cuts = []
     for i in range(1, len(merged)):
-        gap = merged[i][0] - merged[i-1][1]
-        if gap >= min_gap_ticks:
-            cuts.append(round((merged[i-1][1] + merged[i][0]) / 2))
+        gap_start = merged[i-1][1]
+        gap_end = merged[i][0]
+        gap = gap_end - gap_start
 
-    # Also check event tick gaps
-    event_ticks = sorted(set(n["t"] for n in notes) | set(p["t"] for p in pedals))
-    for i in range(1, len(event_ticks)):
-        if event_ticks[i] - event_ticks[i-1] >= min_gap_ticks:
-            cuts.append(round((event_ticks[i-1] + event_ticks[i]) / 2))
+        if gap >= min_gap_ticks:
+            # Place cut in the middle of the silence
+            cuts.append(round((gap_start + gap_end) / 2))
+
+    # Also consider note ending points as potential cuts
+    # These are points where all currently sounding notes have ended
+    note_end_times = sorted(set(n["t"] + n["dur"] for n in notes if n["dur"] > 0))
+    note_start_times = sorted(set(n["t"] for n in notes))
+
+    for end_time in note_end_times:
+        # Check if there's a gap after this note ends
+        next_starts = [t for t in note_start_times if t > end_time]
+        if next_starts:
+            next_start = next_starts[0]
+            if next_start - end_time >= min_gap_ticks:
+                # Good cut point: notes ended and there's a gap
+                cuts.append(round((end_time + next_start) / 2))
 
     return sorted(set(cuts))
 
 
 def _find_slice_local_start(notes, pedals, markers, slice_, slices) -> int:
+    """Find the local start for a slice.
+
+    For measure-based slicing (M), always start from the slice start (measure beginning).
+    For segment-based slicing (S), find the first event.
+    """
+    # For the first slice, always start from 0 to include pre-measure events
+    if slice_["id"] == 1:
+        return slice_["start"]
+
     first = float("inf")
     is_last = slice_["id"] == len(slices)
     for item in [*notes, *pedals, *markers]:
@@ -391,6 +531,7 @@ def _find_slice_local_start(notes, pedals, markers, slice_, slices) -> int:
 
 
 def quantize_pedal_events(pedals: list[dict], epsilon: int = PEDAL_VALUE_EPSILON) -> list[dict]:
+    """First pass: remove pedal events with small value changes."""
     last_by_type: dict[str, dict] = {}
     result = []
     for pedal in pedals:
@@ -400,6 +541,144 @@ def quantize_pedal_events(pedals: list[dict], epsilon: int = PEDAL_VALUE_EPSILON
         result.append(pedal)
         last_by_type[pedal["type"]] = pedal
     return result
+
+
+def smart_quantize_pedals_between_notes(pedals: list[dict], notes: list[dict], measures: list[dict] = None) -> list[dict]:
+    """Smart pedal quantization per segment within measures.
+
+    Within each measure, divide by note events:
+    - Measure start → first note: up to 5 pedals per type
+    - Note i → Note i+1: up to 5 pedals per type
+    - Last note → measure end: up to 5 pedals per type
+
+    Each segment: keep first, last, and up to 3 representative peaks/valleys.
+
+    If no measures provided, falls back to global quantization.
+    """
+    if not pedals:
+        return []
+
+    # First pass: epsilon filtering
+    filtered = quantize_pedal_events(pedals, PEDAL_VALUE_EPSILON)
+
+    # Group pedals by type
+    pedals_by_type: dict[str, list[dict]] = {}
+    for pedal in filtered:
+        pedal_type = pedal["type"]
+        if pedal_type not in pedals_by_type:
+            pedals_by_type[pedal_type] = []
+        pedals_by_type[pedal_type].append(pedal)
+
+    result = []
+
+    if not measures:
+        # Fallback: global quantization
+        for pedal_type, type_pedals in pedals_by_type.items():
+            type_pedals = sorted(type_pedals, key=lambda p: p["t"])
+            if len(type_pedals) <= 5:
+                result.extend(type_pedals)
+                continue
+            quantized = [type_pedals[0]]
+            middle = type_pedals[1:-1]
+            if middle:
+                peaks = _find_pedal_peaks(middle, max_peaks=3)
+                quantized.extend(peaks)
+            quantized.append(type_pedals[-1])
+            result.extend(quantized)
+        return sorted(result, key=lambda p: p["t"])
+
+    # Per-measure, per-segment quantization
+    sorted_notes = sorted(notes, key=lambda n: n["t"])
+
+    for measure in measures:
+        m_start = measure["start"]
+        m_end = measure["end"]
+
+        # Get notes within this measure
+        measure_notes = [n for n in sorted_notes if m_start <= n["t"] < m_end]
+        note_times = [n["t"] for n in measure_notes]
+
+        # Build segment boundaries:
+        # For first measure: 0 → measure_start → note_times → measure_end
+        # For others: measure_start → note_times → measure_end
+        if measure["id"] == 1:
+            boundaries = [0, m_start] + note_times + [m_end]
+        else:
+            boundaries = [m_start] + note_times + [m_end]
+
+        for pedal_type, type_pedals in pedals_by_type.items():
+            type_pedals_sorted = sorted(type_pedals, key=lambda p: p["t"])
+
+            # Process each segment
+            for seg_idx in range(len(boundaries) - 1):
+                seg_start = boundaries[seg_idx]
+                seg_end = boundaries[seg_idx + 1]
+
+                # Find pedals in this segment
+                segment_pedals = [p for p in type_pedals_sorted if seg_start <= p["t"] < seg_end]
+
+                # Quantize if more than 5
+                if len(segment_pedals) <= 5:
+                    result.extend(segment_pedals)
+                else:
+                    quantized = [segment_pedals[0]]
+                    middle = segment_pedals[1:-1]
+                    if middle:
+                        peaks = _find_pedal_peaks(middle, max_peaks=3)
+                        quantized.extend(peaks)
+                    quantized.append(segment_pedals[-1])
+                    result.extend(quantized)
+
+    # Deduplicate
+    seen = set()
+    deduped = []
+    for p in result:
+        key = (p["t"], p["type"])
+        if key not in seen:
+            seen.add(key)
+            deduped.append(p)
+
+    return sorted(deduped, key=lambda p: p["t"])
+
+
+
+def _find_pedal_peaks(pedals: list[dict], max_peaks: int = 3) -> list[dict]:
+    """Find representative peaks/valleys in a pedal curve.
+
+    Returns at most max_peaks points that best represent the curve shape.
+    """
+    if len(pedals) <= max_peaks:
+        return pedals
+
+    # Calculate importance score for each point based on local extrema
+    scores = []
+    for i, pedal in enumerate(pedals):
+        if i == 0 or i == len(pedals) - 1:
+            scores.append((0, pedal))  # Endpoints handled separately
+            continue
+
+        prev_val = pedals[i - 1]["val"]
+        curr_val = pedal["val"]
+        next_val = pedals[i + 1]["val"]
+
+        # Score based on how much this point deviates from linear interpolation
+        expected_val = (prev_val + next_val) / 2
+        deviation = abs(curr_val - expected_val)
+
+        # Also consider if it's a local extremum
+        is_peak = (curr_val > prev_val and curr_val > next_val)
+        is_valley = (curr_val < prev_val and curr_val < next_val)
+        extremum_bonus = 20 if (is_peak or is_valley) else 0
+
+        score = deviation + extremum_bonus
+        scores.append((score, pedal))
+
+    # Sort by score and take top max_peaks
+    scores.sort(key=lambda x: x[0], reverse=True)
+    selected = [pedal for _, pedal in scores[:max_peaks]]
+
+    # Return in time order
+    return sorted(selected, key=lambda p: p["t"])
 
 
 # ── Scale helpers ──────────────────────────────────────────────────────────
@@ -477,7 +756,7 @@ def bake_timed_records_to_standard_ticks(records: list[dict], tempo_map: list[di
 
 # ── MIDI → TSV ─────────────────────────────────────────────────────────────
 
-def midi_to_tsv(data: bytes, source: str = "unknown.mid") -> str:
+def midi_to_tsv(data: bytes, source: str = "unknown.mid", annotation_path: str = None) -> str:
     tpq, raw_tracks = parse_midi(data)
     if not tpq:
         raise ValueError("Only tick-based MIDI files are supported")
@@ -552,7 +831,7 @@ def midi_to_tsv(data: bytes, source: str = "unknown.mid") -> str:
 
     tempo_map = build_original_tempo_map(tpq, tempos)
     notes = bake_notes_to_standard_ticks(notes, tempo_map)
-    pedals = quantize_pedal_events(bake_timed_records_to_standard_ticks(pedals, tempo_map))
+    baked_pedals = bake_timed_records_to_standard_ticks(pedals, tempo_map)
     markers = bake_timed_records_to_standard_ticks(markers, tempo_map)
     time_sigs = [
         {**sig, "tick": original_tick_to_standard_tick(sig["tick"], tempo_map)}
@@ -565,16 +844,34 @@ def midi_to_tsv(data: bytes, source: str = "unknown.mid") -> str:
     end_tick = max(
         [original_tick_to_standard_tick(end_tick, tempo_map)]
         + [n["t"] + n["dur"] for n in notes]
-        + [p["t"] for p in pedals]
+        + [p["t"] for p in baked_pedals]
         + [m["t"] for m in markers]
     )
-    slices = create_slices(notes, pedals, end_tick)
+
+    # Determine slice type and create slices/measures
+    if annotation_path:
+        annotation_data = parse_annotation_file(annotation_path)
+        slices = create_measures_from_annotation(annotation_data, tempo_map)
+        # Set end tick for last measure
+        if slices:
+            slices[-1]["end"] = end_tick
+        slice_type = "measure"
+        slice_prefix = "M"
+    else:
+        slices = create_slices(notes, baked_pedals, end_tick)
+        slice_type = "segment"
+        slice_prefix = "S"
+
+    # Apply smart quantization per measure/segment
+    pedals = smart_quantize_pedals_between_notes(baked_pedals, notes, slices)
+
     detected_key = detect_key_from_notes(notes)
 
     # Build output
     lines: list[str] = [
         "# midi-tsv v0.2",
         f"# source={source}",
+        f"# slice_type={slice_type}",
         "# unit=tick",
         f"# tick_scale={STANDARD_TICK_SCALE}",
         f"# tpq={STANDARD_TPQ}",
@@ -597,32 +894,53 @@ def midi_to_tsv(data: bytes, source: str = "unknown.mid") -> str:
 
     for sl in slices:
         local_start = _find_slice_local_start(notes, pedals, markers, sl, slices)
-        lines.append(f"S{sl['id']}\t{local_start}\t{sl['end']}")
+
+        lines.append(f"{slice_prefix}{sl['id']}\t{local_start}\t{sl['end']}")
 
         records = []
         is_last = sl["id"] == len(slices)
+
+        # For notes, use local_start as boundary
         slice_notes = [n for n in notes if n["t"] >= local_start and (n["t"] < sl["end"] or is_last)]
         slice_key = detect_key_from_notes(slice_notes) if slice_notes else detected_key
         for n in slice_notes:
+            offset = max(0, n["t"] - local_start)
             records.append({
                 "t": n["t"],
                 "order": 1,
-                "line": f"{midi_pitch_to_abc_smart(n['pitch'], slice_key)}:{n['dur']}\t{n['t'] - local_start}\t{n['vel']}",
+                "line": f"{midi_pitch_to_abc_smart(n['pitch'], slice_key)}:{n['dur']}\t{offset}\t{n['vel']}",
             })
+
+        # For pedals and markers within the slice (include pre-measure events for first slice)
         for p in pedals:
-            if p["t"] >= local_start and (p["t"] < sl["end"] or is_last):
+            if p["t"] < sl["start"] and sl["id"] == 1:
+                # Pre-measure pedal: show at offset 0
+                records.append({
+                    "t": p["t"],
+                    "order": 0,
+                    "line": f"{p['type']}\t0\t{p['val']}",
+                })
+            elif p["t"] >= local_start and (p["t"] < sl["end"] or is_last):
                 records.append({
                     "t": p["t"],
                     "order": 0,
                     "line": f"{p['type']}\t{p['t'] - local_start}\t{p['val']}",
                 })
+
         for m in markers:
-            if m["t"] >= local_start and (m["t"] < sl["end"] or is_last):
+            if m["t"] < sl["start"] and sl["id"] == 1:
+                records.append({
+                    "t": m["t"],
+                    "order": 2,
+                    "line": f"M\t0\t{json.dumps(m['text'])}",
+                })
+            elif m["t"] >= local_start and (m["t"] < sl["end"] or is_last):
                 records.append({
                     "t": m["t"],
                     "order": 2,
                     "line": f"M\t{m['t'] - local_start}\t{json.dumps(m['text'])}",
                 })
+
         records.sort(key=lambda r: (r["t"], r["order"]))
         for r in records:
             lines.append(r["line"])
@@ -644,6 +962,8 @@ def _tsv_v2_to_midi(tsv: str, meta: dict) -> bytes:
     events: list[dict] = []
     current_slice_start = 0
     channel = meta.get("channel", 0)
+    slice_type = meta.get("slice_type", "segment")
+    slice_prefix = "M" if slice_type == "measure" else "S"
 
     for line_idx, raw_line in enumerate(tsv.splitlines()):
         line = raw_line.strip()
@@ -653,7 +973,7 @@ def _tsv_v2_to_midi(tsv: str, meta: dict) -> bytes:
         fields = raw_line.split("\t")
         record_type = fields[0]
 
-        if _is_slice_record(record_type):
+        if _is_slice_record(record_type, slice_prefix):
             _require(fields, 3, line_idx)
             current_slice_start = _parse_non_negative(fields[1], line_idx) * meta["tick_scale"]
         elif _is_note_record(record_type):
@@ -809,7 +1129,7 @@ def _parse_tsv_meta(tsv: str) -> dict:
     meta = {
         "version": "v0.2", "tpq": STANDARD_TPQ, "tick_scale": 1,
         "tempos": [], "time_signatures": [], "key_signatures": [],
-        "track_channels": {}, "channel": 0,
+        "track_channels": {}, "channel": 0, "slice_type": "segment",
     }
     for raw_line in tsv.splitlines():
         line = raw_line.strip()
@@ -832,6 +1152,8 @@ def _parse_tsv_meta(tsv: str) -> dict:
             meta["tick_scale"] = int(val)
         elif key == "channel":
             meta["channel"] = int(val)
+        elif key == "slice_type":
+            meta["slice_type"] = val
         elif key == "tempo":
             parts = val.split(",")
             tick = int(parts[0]) * meta["tick_scale"]
@@ -862,8 +1184,10 @@ def _is_abc_pitch(s: str) -> bool:
     return bool(re.match(r"^[_^=]*[A-Ga-g]['|,]*$", s))
 
 
-def _is_slice_record(s: str) -> bool:
-    return bool(re.match(r"^S\d+$", s))
+def _is_slice_record(s: str, prefix: str = None) -> bool:
+    if prefix:
+        return bool(re.match(rf"^{prefix}\d+$", s))
+    return bool(re.match(r"^[SM]\d+$", s))
 
 
 def _is_note_record(s: str) -> bool:
@@ -920,6 +1244,7 @@ def main():
     p2t = sub.add_parser("midi2tsv", help="MIDI → TSV")
     p2t.add_argument("input", help="Input .mid file")
     p2t.add_argument("--out", "-o", help="Output .tsv file (default: input + '.tsv')")
+    p2t.add_argument("--annotation", "-a", help="Annotation file for measure-based slicing")
 
     t2m = sub.add_parser("tsv2midi", help="TSV → MIDI")
     t2m.add_argument("input", help="Input .tsv file")
@@ -931,7 +1256,8 @@ def main():
         in_path = Path(args.input)
         out_path = Path(args.out) if args.out else in_path.with_suffix(in_path.suffix + ".tsv")
         data = in_path.read_bytes()
-        tsv = midi_to_tsv(data, source=in_path.name)
+        annotation_path = args.annotation if hasattr(args, 'annotation') else None
+        tsv = midi_to_tsv(data, source=in_path.name, annotation_path=annotation_path)
         out_path.write_text(tsv)
         print(f"Written: {out_path}")
     elif args.command == "tsv2midi":

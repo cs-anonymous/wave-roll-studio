@@ -69,9 +69,9 @@ const STANDARD_TICK_SCALE = 1;
 const STANDARD_TICK_MS = 10;
 const STANDARD_TEMPO_MICROSECONDS_PER_BEAT = 500000;
 const MIN_SLICE_SECONDS = 10;
-const TARGET_SLICE_SECONDS = 15;
-const MAX_SLICE_SECONDS = 20;
-const MIN_GAP_SECONDS = 0.35;
+const TARGET_SLICE_SECONDS = 20;
+const MAX_SLICE_SECONDS = 30;
+const MIN_GAP_SECONDS = 0.5;
 const PEDAL_VALUE_EPSILON = 3;
 
 const NATURAL_PITCH_CLASS: Record<string, number> = {
@@ -631,10 +631,13 @@ function findWeakCutCandidates(
   pedals: PedalRecord[],
   minGapTicks: number
 ): number[] {
-  const intervals = notes
+  // Build intervals for when notes are sounding
+  const noteIntervals = notes
     .map((note) => ({ start: note.t, end: note.t + note.dur }))
-    .filter((interval) => interval.end >= interval.start);
+    .filter((interval) => interval.end > interval.start);
 
+  // Build intervals for when pedal is down (sustaining sound)
+  const pedalIntervals: Array<{ start: number; end: number }> = [];
   let pedalDownTick: number | undefined;
   for (const pedal of [...pedals].sort((a, b) => a.t - b.t)) {
     if (pedal.type !== "P") {
@@ -643,12 +646,14 @@ function findWeakCutCandidates(
     if (pedal.val >= 64 && pedalDownTick === undefined) {
       pedalDownTick = pedal.t;
     } else if (pedal.val < 64 && pedalDownTick !== undefined) {
-      intervals.push({ start: pedalDownTick, end: pedal.t });
+      pedalIntervals.push({ start: pedalDownTick, end: pedal.t });
       pedalDownTick = undefined;
     }
   }
 
-  const merged = intervals
+  // Combine note and pedal intervals to find when sound is active
+  const allIntervals = [...noteIntervals, ...pedalIntervals];
+  const merged = allIntervals
     .sort((a, b) => a.start - b.start || a.end - b.end)
     .reduce<Array<{ start: number; end: number }>>((acc, interval) => {
       const previous = acc[acc.length - 1];
@@ -660,12 +665,31 @@ function findWeakCutCandidates(
       return acc;
     }, []);
 
+  // Find gaps between merged intervals (silence periods)
   const cuts: number[] = [];
   for (let i = 1; i < merged.length; i++) {
-    const previousEnd = merged[i - 1].end;
-    const nextStart = merged[i].start;
-    if (nextStart - previousEnd >= minGapTicks) {
-      cuts.push(Math.round((previousEnd + nextStart) / 2));
+    const gapStart = merged[i - 1].end;
+    const gapEnd = merged[i].start;
+    const gap = gapEnd - gapStart;
+
+    if (gap >= minGapTicks) {
+      // Place cut in the middle of the silence
+      cuts.push(Math.round((gapStart + gapEnd) / 2));
+    }
+  }
+
+  // Also consider note ending points as potential cuts
+  const noteEndTimes = [...new Set(notes.filter((n) => n.dur > 0).map((n) => n.t + n.dur))].sort(
+    (a, b) => a - b
+  );
+  const noteStartTimes = [...new Set(notes.map((n) => n.t))].sort((a, b) => a - b);
+
+  for (const endTime of noteEndTimes) {
+    // Check if there's a gap after this note ends
+    const nextStart = noteStartTimes.find((t) => t > endTime);
+    if (nextStart !== undefined && nextStart - endTime >= minGapTicks) {
+      // Good cut point: notes ended and there's a gap
+      cuts.push(Math.round((endTime + nextStart) / 2));
     }
   }
 
@@ -892,7 +916,7 @@ function sortTimed<T extends { t?: number; tick?: number }>(a: T, b: T): number 
 }
 
 function isSliceRecord(s: string): boolean {
-  return /^S\d+$/.test(s);
+  return /^[SM]\d+$/.test(s);
 }
 
 function isPedalRecord(s: string): s is PedalType {

@@ -32,6 +32,7 @@
 # tick_ms=10
 # pitch=abc-absolute
 # detected_key=C
+# slice_type=segment   # 或 "measure"，决定使用 S 或 M 前缀
 # tempo=0,500000
 
 S1	0	1140
@@ -70,21 +71,29 @@ E:410	460	63
 
 # 记录类型详解
 
-## Slice 记录
+## Slice / Measure 记录
 
 ```tsv
-S<id>	<start_tick>	<end_tick>
+S<id>	<start_tick>	<end_tick>    # Segment 模式
+M<id>	<start_tick>	<end_tick>    # Measure 模式
 ```
 
-**示例**：
+**Segment 示例**：
 ```tsv
 S1	0	1140
 S2	1140	2280
 ```
 
+**Measure 示例**：
+```tsv
+M1	0	1200
+M2	1200	2400
+```
+
 **说明**：
-- `S1` 将 Slice 标识和 ID 直接连接
-- `start_tick` 是该 slice 第一个事件的绝对 tick（macro-tick）
+- `S` 前缀用于 Segment 模式（基于静音间隙启发式切分）
+- `M` 前缀用于 Measure 模式（基于 annotation 文件的音乐小节切分）
+- `start_tick` 是该 slice 的绝对起始 tick（macro-tick）
 - `end_tick` 是该 slice 的结束 tick
 - Slice 内所有事件的 time 都是相对于 `start_tick` 的偏移
 
@@ -415,6 +424,120 @@ def create_slices(notes, pedals, end_tick, ...):
 - ✅ 优先选择自然的静音点
 - ✅ 保证每个 slice 长度合理
 - ✅ 对 LLM 友好
+
+---
+
+## Measure 模式（小节切分）
+
+除了基于静音间隙的 Segment 模式（`S` 前缀），MIDI-TSV 还支持基于音乐小节结构的 Measure 模式（`M` 前缀）。
+
+### 模式标识
+
+通过 header 中的 `# slice_type=` 区分：
+
+```
+# slice_type=segment   # 基于静音间隙的启发式切片
+# slice_type=measure   # 基于注释文件的音乐小节切片
+```
+
+### Measure 记录格式
+
+```tsv
+M<id>	<start_tick>	<end_tick>
+```
+
+**示例**：
+```tsv
+M1	0	1200
+M2	1200	2400
+M3	2400	3600
+```
+
+与 `S` 前缀的 Slice 记录类似，`M` 前缀表示该切片对应一个音乐小节。start/end tick 为绝对 tick 值，slice 内事件的 time 相对于 `start_tick`。
+
+### Annotation 文件格式
+
+Measure 模式需要一个 annotation 文件（通常为 `*_annotations.txt`）来标记 downbeat（小节起始）和 beat 位置：
+
+```
+time	offset	type[,time_signature[,offset_beat]]
+```
+
+| 字段 | 说明 |
+|------|------|
+| `time` | 时间（秒） |
+| `offset` | 偏移（秒，通常与 time 相同） |
+| `type` | `db` = downbeat（小节起始），`b` = beat |
+| `time_signature` | 可选，如 `4/4`、`3/4`，仅在 downbeat 上出现 |
+| `offset_beat` | 可选，从 0 开始的小节内拍数 |
+
+**示例**：
+```
+0.0	0.0	db,4/4,0
+0.491804	0.491804	b
+0.983608	0.983608	b
+1.475412	1.475412	b
+1.967216	1.967216	db,4/4,0
+```
+
+每个 `db` 事件标记一个小节的开始，两个连续 `db` 之间的时间范围构成一个小节。
+
+### 小节构建
+
+1. 从 annotation 文件中提取所有 `db` 事件作为小节边界
+2. 将 MIDI 音符/踏板事件从原始 tick 转换为 annotation 时间轴的 tick
+3. 按 downbeat 边界划分小节
+4. 第一个小节从时间 0 开始，包含该时间点之前的所有事件
+
+### M1 之前的踏板处理
+
+第一个小节（M1）之前可能已有踏板事件（乐曲开始前的踏板按下）。这些踏板事件**不会被丢弃**，而是保留在 M1 内，offset 写为 `0`：
+
+```tsv
+# midi-tsv v0.2
+# slice_type=measure
+# ...
+
+M1	0	1200
+P	0	127          # 乐曲开始前的踏板，offset=0
+P1	0	64
+^E:400	0	80       # M1 内的第一个音符
+```
+
+注意：M1 的 `start_tick` 仍然是其真实的起始 tick（可能为 0 或更早），pre-measure 踏板以 offset 0 写入以保持格式一致性。
+
+### 智能踏板量化
+
+小节内两个连续事件（音符或边界）之间可能有大量踏板事件（上百个）。采用分段量化策略：
+
+**步骤**：
+
+1. 确定小节内的事件边界：`[measure_start, note_times..., measure_end]`
+2. 在每个相邻事件对之间的区间内，分别进行量化
+3. 每个区间内每种踏板类型最多保留 **5 个点**：
+   - 第一个点
+   - 最后一个点
+   - 中间最多 3 个代表性极值点（峰值/谷值）
+
+```python
+# 小节内的事件边界
+boundaries = [measure_start] + sorted(note_times) + [measure_end]
+
+for i in range(len(boundaries) - 1):
+    seg_start = boundaries[i]
+    seg_end = boundaries[i + 1]
+    # 对此区间内的踏板事件进行量化
+    segment_pedals = [p for p in pedals if seg_start <= p["t"] < seg_end]
+    quantized = smart_quantize(segment_pedals, max_points=5)
+```
+
+**量化细节**：
+
+- **去冗余**：先过滤变化 ≤ 3 的事件（`abs(prev_value - curr_value) ≤ 3`）
+- **极值选择**：在剩余事件中找到局部极大值和极小值，优先保留变化最大的 3 个点
+- 这样可以在大幅减少事件数的同时，保留踏板曲线的整体形状
+
+**效果**：原本一个小节内数百个踏板事件可减少到几十个，但踏板曲线的主要起伏特征被保留。
 
 ---
 

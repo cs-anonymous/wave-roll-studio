@@ -678,7 +678,8 @@ function parseTsvIndex(tsv: string): TsvIndex {
     }
 
     const fields = raw.split("\t");
-    if (/^S\d+$/.test(fields[0]) && fields.length >= 3) {
+    // Support both S (segment) and M (measure) slice types
+    if (/^[SM]\d+$/.test(fields[0]) && fields.length >= 3) {
       currentSliceStart = Number(fields[1]) * tickScale;
       endTick = Math.max(endTick, Number(fields[2]) * tickScale);
       rows.push({
@@ -690,7 +691,7 @@ function parseTsvIndex(tsv: string): TsvIndex {
       return;
     }
 
-    if (fields[0] === "S" && fields.length >= 4) {
+    if ((fields[0] === "S" || fields[0] === "M") && fields.length >= 4) {
       currentSliceStart = Number(fields[2]) * tickScale;
       endTick = Math.max(endTick, Number(fields[3]) * tickScale);
       rows.push({

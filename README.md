@@ -1,73 +1,65 @@
-# WaveRoll Piano - MIDI Editor & Viewer
+# WaveRoll Piano - MIDI Editor & MIDI-TSV
 
-> **WaveRoll Piano** is a [VS Code extension](https://marketplace.visualstudio.com/items?itemName=crescent-stdio.wave-roll-piano) for viewing, editing, and playing MIDI files with an interactive piano roll visualization. Supports conversion between MIDI and MIDI-TSV formats.
+VS Code extension for viewing, editing, and playing MIDI files with an interactive piano roll,
+plus a Python tool for converting MIDI ↔ MIDI-TSV with support for both **segment-based** and **measure-based** slicing.
 
-![License](https://img.shields.io/badge/license-MIT-blue.svg)
+## Plugin
 
-Built on top of [**WaveRoll**](https://github.com/crescent-stdio/wave-roll), an interactive JavaScript library for MIDI piano roll visualization.
+Install from VS Code Marketplace as **WaveRoll Piano** (`wave-roll-piano-0.5.0.vsix`).
 
-## Features
+### Features
+- Piano roll visualization powered by [wave-roll](https://www.npmjs.com/package/wave-roll)
+- Audio playback via Tone.js (Default / Salamander C5 piano sounds)
+- MIDI-TSV text editing: preview, edit, save → writes back to MIDI
+- Multi-file comparison
+- Supported formats: `.mid`, `.midi`, `.mid.tsv`, `.midi.tsv`
 
-- **Piano Roll Visualization**: View MIDI files as an interactive piano roll display powered by the [wave-roll](https://www.npmjs.com/package/wave-roll) library
-- **Audio Playback**: Play MIDI files directly in VS Code using Tone.js synthesis with multiple piano sounds (Default / Salamander C5)
-- **MIDI-TSV Conversion**: View and edit MIDI as a text-based TSV representation — switch between Preview and Edit mode, modify TSV text, then save to write back to MIDI
-- **Multi-File Comparison**: Load multiple MIDI files for side-by-side visualization
-- **Audio Reference Import**: Add a reference audio track (`.wav`, `.mp3`, `.m4a`, `.ogg`)
-- **MIDI Export**: Export modified MIDI files to disk
-- **Format Support**: `.mid`, `.midi`, `.mid.tsv`, `.midi.tsv`
+### Commands
+Right-click in explorer:
+- **Export MIDI as TSV** — convert `.mid` to `.mid.tsv`
+- **Export MIDI-TSV as MIDI** — convert `.mid.tsv` back to `.mid`
 
-## Installation
+## MIDI-TSV Format
 
-1. Open VS Code
-2. Go to Extensions
-3. Search for **"WaveRoll Piano"**
-4. Click **Install**
+See [MIDI-TSV.md](MIDI-TSV.md) for the full format specification covering:
+- Segment mode (`S`-prefix) vs measure mode (`M`-prefix) slicing
+- Record types and field formats
+- Annotation file format for downbeat/beat markers
+- Pedal encoding and quantization
 
-Or install directly from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=crescent-stdio.wave-roll-piano)
-or [Open VSX](https://open-vsx.org/extension/crescent-stdio/wave-roll-piano).
+## Python Tools
 
-## Usage
+### midi2tsv / tsv2midi
 
-1. Open any `.mid`, `.midi`, `.mid.tsv`, or `.midi.tsv` file in VS Code
-2. The file automatically opens in the WaveRoll Piano viewer
-3. Use the player controls to interact with the MIDI file
-4. Click **Add MIDI Files** to layer additional MIDI files for comparison
-5. Click **Add Audio File** to load a reference audio track
+```bash
+# MIDI → TSV (segment mode, heuristic slicing)
+python midi_tsv.py midi2tsv input.mid
 
-## TSV Editing
+# MIDI → TSV (measure mode, annotation-driven)
+python midi_tsv.py midi2tsv input.mid --annotation annotations.txt
 
-The right panel displays a MIDI-TSV text representation of the MIDI file:
+# TSV → MIDI (auto-detects slice_type)
+python midi_tsv.py tsv2midi input.mid.tsv
 
-- **Preview mode**: Click on TSV rows to seek in the playback timeline
-- **Edit mode**: Click the ✎ icon in the panel header to switch to a text editor. Modify the TSV text, then press **Cmd+S** / **Ctrl+S** to save. The TSV is converted back to MIDI and written to disk.
+# Custom output path
+python midi_tsv.py midi2tsv input.mid --annotation annotations.txt --out output.tsv
+```
 
-## MIDI-TSV Commands
+### Batch convert
 
-Right-click a MIDI file in the explorer to:
-- **Export MIDI as TSV**: Convert `.mid`/`.midi` to `.mid.tsv`
-- **Export MIDI-TSV as MIDI**: Convert `.mid.tsv`/`.midi.tsv` to `.mid`/`.midi`
+```bash
+python batch_convert_asap.py /path/to/dataset
+```
 
-## Controls
+Scans recursively for `.mid` files, finds matching `*_annotations.txt`,
+and generates measure-based `.mid.tsv` files.
 
-- **Play/Pause**: Start or pause MIDI playback
-- **Stop**: Stop playback and reset to beginning
-- **Tempo**: Click the BPM badge to adjust playback tempo
-- **Export**: Export MIDI with the current tempo setting
-- **Piano Sound**: Switch between Default and Salamander C5 piano samples
+### Pedal quantization
 
-## Related Projects
-
-- **WaveRoll Library**: [GitHub](https://github.com/crescent-stdio/wave-roll) | [NPM](https://www.npmjs.com/package/wave-roll)
-- **Web Demo**: [https://crescent-stdio.github.io/wave-roll/](https://crescent-stdio.github.io/wave-roll/)
-- **Standalone Demo**: [https://crescent-stdio.github.io/wave-roll/standalone.html](https://crescent-stdio.github.io/wave-roll/standalone.html)
-
-## Tech Stack
-
-- **[wave-roll](https://www.npmjs.com/package/wave-roll)**: Interactive piano roll rendering engine
-- **[Tone.js](https://tonejs.github.io/)**: Web Audio synthesis framework
-- **[@tonejs/midi](https://github.com/Tonejs/Midi)**: MIDI file parsing
-- **[midi-file](https://www.npmjs.com/package/midi-file)**: Binary MIDI parsing and serialization
-- **[esbuild](https://esbuild.github.io/)**: Fast JavaScript bundler
+Both modes apply smart pedal quantization: within each segment (between
+consecutive note events or measure boundaries), each pedal type keeps at
+most 5 points — first, last, and up to 3 representative peaks/valleys.
+Redundant events (value change ≤ 3) are filtered first.
 
 ## License
 
