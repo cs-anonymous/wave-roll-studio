@@ -1,7 +1,9 @@
 # WaveRoll Piano - MIDI Editor & MIDI-TSV
 
 VS Code extension for viewing, editing, and playing MIDI files with an interactive piano roll,
-plus a Python tool for converting MIDI ↔ MIDI-TSV with support for both **segment-based** and **measure-based** slicing.
+plus a Python tool for converting MIDI ↔ MIDI-TSV. MIDI → TSV defaults to
+**measure-based** slicing: existing annotation files are used when supplied,
+otherwise performance downbeats are predicted with Omnizart's beat module.
 
 ## Plugin
 
@@ -32,18 +34,24 @@ See [MIDI-TSV.md](MIDI-TSV.md) for the full format specification covering:
 ### midi2tsv / tsv2midi
 
 ```bash
-# MIDI → TSV (segment mode, heuristic slicing)
+# MIDI → TSV (measure mode; auto-detect downbeats with Omnizart)
 python midi_tsv.py midi2tsv input.mid
 
-# MIDI → TSV (measure mode, annotation-driven)
+# MIDI → TSV (measure mode, annotation-driven; preferred when available)
 python midi_tsv.py midi2tsv input.mid --annotation annotations.txt
+
+# Debug/fallback only: old segment mode heuristic slicing
+python midi_tsv.py midi2tsv input.mid --no-auto-downbeat
 
 # TSV → MIDI (auto-detects slice_type)
 python midi_tsv.py tsv2midi input.mid.tsv
 
 # Custom output path
-python midi_tsv.py midi2tsv input.mid --annotation annotations.txt --out output.tsv
+python midi_tsv.py midi2tsv input.mid --out output.tsv
 ```
+
+Automatic downbeat detection requires Omnizart to be installed in the Python
+environment used to run `midi_tsv.py`.
 
 ### Batch convert
 
@@ -51,8 +59,9 @@ python midi_tsv.py midi2tsv input.mid --annotation annotations.txt --out output.
 python batch_convert_asap.py /path/to/dataset
 ```
 
-Scans recursively for `.mid` files, finds matching `*_annotations.txt`,
-and generates measure-based `.mid.tsv` files.
+Scans recursively for `.mid` files, uses matching `*_annotations.txt` files
+when present, and otherwise predicts downbeats with Omnizart. All generated
+`.mid.tsv` files are measure-based by default.
 
 ### Pedal quantization
 

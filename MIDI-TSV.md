@@ -32,7 +32,8 @@
 # tick_ms=10
 # pitch=abc-absolute
 # detected_key=C
-# slice_type=segment   # 或 "measure"，决定使用 S 或 M 前缀
+# slice_type=measure   # 默认：基于 annotation 或自动识别的 downbeat
+# slice_type=segment   # 仅调试/回退：启发式分片
 # tempo=0,500000
 
 S1	0	1140
@@ -429,15 +430,18 @@ def create_slices(notes, pedals, end_tick, ...):
 
 ## Measure 模式（小节切分）
 
-除了基于静音间隙的 Segment 模式（`S` 前缀），MIDI-TSV 还支持基于音乐小节结构的 Measure 模式（`M` 前缀）。
+MIDI-TSV 的 MIDI → TSV 默认使用基于音乐小节结构的 Measure 模式（`M` 前缀）。
+如果提供 annotation 文件，使用其中的 downbeat；如果没有 annotation，则通过
+Omnizart beat module 从 performance MIDI 自动识别 downbeat。Segment 模式（`S`
+前缀）仅作为调试/回退路径保留。
 
 ### 模式标识
 
 通过 header 中的 `# slice_type=` 区分：
 
 ```
-# slice_type=segment   # 基于静音间隙的启发式切片
-# slice_type=measure   # 基于注释文件的音乐小节切片
+# slice_type=measure   # 基于 downbeat 的音乐小节切片
+# slice_type=segment   # 基于静音间隙的启发式切片（回退）
 ```
 
 ### Measure 记录格式
@@ -457,7 +461,9 @@ M3	2400	3600
 
 ### Annotation 文件格式
 
-Measure 模式需要一个 annotation 文件（通常为 `*_annotations.txt`）来标记 downbeat（小节起始）和 beat 位置：
+Measure 模式可以使用 annotation 文件（通常为 `*_annotations.txt`）来标记
+downbeat（小节起始）和 beat 位置；如果没有 annotation，转换器会调用 Omnizart
+预测 performance MIDI 中的 downbeat，并生成同等的内存 annotation 数据：
 
 ```
 time	offset	type[,time_signature[,offset_beat]]
@@ -481,6 +487,8 @@ time	offset	type[,time_signature[,offset_beat]]
 ```
 
 每个 `db` 事件标记一个小节的开始，两个连续 `db` 之间的时间范围构成一个小节。
+自动预测路径只要求 downbeat 秒时间；beat 行可用于记录完整 annotation，但当前
+小节切分只依赖 `db`。
 
 ### 小节构建
 

@@ -36,11 +36,6 @@ def batch_convert(dataset_root: str, output_suffix: str = ".tsv"):
         # Find annotation file
         annotation_file = find_annotation_for_midi(midi_file)
 
-        if not annotation_file:
-            print(f"[{i}/{len(midi_files)}] SKIP: No annotation for {midi_file.name}")
-            skipped += 1
-            continue
-
         # Output path
         output_path = midi_file.with_suffix(midi_file.suffix + output_suffix)
 
@@ -56,13 +51,15 @@ def batch_convert(dataset_root: str, output_suffix: str = ".tsv"):
             tsv_content = midi_to_tsv(
                 midi_data,
                 source=midi_file.name,
-                annotation_path=str(annotation_file)
+                annotation_path=str(annotation_file) if annotation_file else None,
+                midi_path=midi_file,
             )
 
             # Write output
             output_path.write_text(tsv_content)
 
-            print(f"[{i}/{len(midi_files)}] ✓ {midi_file.name} -> {output_path.name}")
+            source = "annotation" if annotation_file else "omnizart"
+            print(f"[{i}/{len(midi_files)}] ✓ {midi_file.name} -> {output_path.name} ({source})")
             converted += 1
 
         except Exception as e:

@@ -3,18 +3,23 @@
 MIDI-TSV v0.2: bidirectional conversion between MIDI files and MIDI-TSV text.
 
 Usage:
-    python midi_tsv.py midi2tsv <input.mid>        # creates <input.mid>.tsv
+    python midi_tsv.py midi2tsv <input.mid>        # measure mode; auto-detects downbeats
     python midi_tsv.py tsv2midi <input.tsv>         # creates <input>.mid
     python midi_tsv.py midi2tsv <input.mid> --out <path>
     python midi_tsv.py tsv2midi <input.tsv> --out <path>
-    python midi_tsv.py midi2tsv <input.mid> --annotation <annotation.txt>  # measure-based
+    python midi_tsv.py midi2tsv <input.mid> --annotation <annotation.txt>
+    python midi_tsv.py midi2tsv <input.mid> --no-auto-downbeat  # segment fallback
 """
 
 import argparse
+import csv
 import json
 import re
+import shutil
 import struct
+import subprocess
 import sys
+import tempfile
 from collections import defaultdict
 from pathlib import Path
 
@@ -307,6 +312,10 @@ def abc_pitch_to_midi(pitch: str) -> int:
 
 # ── Annotation parsing ─────────────────────────────────────────────────────
 
+class DownbeatDetectionError(RuntimeError):
+    """Raised when automatic performance-MIDI downbeat detection fails."""
+
+
 def parse_annotation_file(annotation_path: str) -> dict:
     """Parse annotation file and return downbeats, beats, and time signature info.
 
@@ -359,6 +368,121 @@ def parse_annotation_file(annotation_path: str) -> dict:
         "downbeats": downbeats,
         "beats": beats,
     }
+
+
+def detect_annotation_with_omnizart(
+    midi_data: bytes,
+    source: str = "unknown.mid",
+    midi_path: str | Path | None = None,
+) -> dict:
+    """Predict beat/downbeat annotations from a performance MIDI with Omnizart.
+
+    Omnizart's beat module writes *_beat.csv and *_down_beat.csv files whose
+    values are in seconds. We convert those into the same in-memory annotation
+    shape as parse_annotation_file(), so downstream measure slicing stays
+    identical for human and predicted annotations.
+    """
+    with tempfile.TemporaryDirectory(prefix="midi_tsv_omnizart_") as tmp:
+        tmp_dir = Path(tmp)
+        input_path = Path(midi_path) if midi_path else tmp_dir / _safe_midi_filename(source)
+        if not midi_path:
+            input_path.write_bytes(midi_data)
+
+        output_dir = tmp_dir / "out"
+        output_dir.mkdir()
+
+        _run_omnizart(input_path, output_dir)
+
+        downbeat_file = _find_omnizart_csv(output_dir, downbeat=True)
+        beat_file = _find_omnizart_csv(output_dir, downbeat=False)
+
+        downbeats = _read_time_csv(downbeat_file) if downbeat_file else []
+        beats = _read_time_csv(beat_file) if beat_file else []
+
+    if not downbeats:
+        raise DownbeatDetectionError(
+            "Omnizart did not produce any downbeats; cannot create measure-mode MIDI-TSV"
+        )
+
+    return {
+        "downbeats": [(t, None) for t in downbeats],
+        "beats": beats,
+    }
+
+
+def _run_omnizart(input_path: Path, output_dir: Path) -> None:
+    executable = shutil.which("omnizart")
+    errors = []
+
+    if executable:
+        cmd = [executable, "beat", "transcribe", "-o", str(output_dir), str(input_path)]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            return
+        except subprocess.CalledProcessError as exc:
+            errors.append(_format_subprocess_error(cmd, exc))
+
+    try:
+        from omnizart.beat.app import BeatTranscription
+    except Exception as exc:
+        errors.append(f"Python import failed: {type(exc).__name__}: {exc}")
+    else:
+        try:
+            BeatTranscription().transcribe(str(input_path), output=str(output_dir))
+            return
+        except Exception as exc:
+            errors.append(f"Python API failed: {type(exc).__name__}: {exc}")
+
+    detail = "\n".join(errors) if errors else "omnizart executable/module not found"
+    raise DownbeatDetectionError(
+        "Automatic downbeat detection requires Omnizart beat module.\n"
+        "Install it in the Python environment used by midi_tsv.py, then retry.\n"
+        f"{detail}"
+    )
+
+
+def _format_subprocess_error(cmd: list[str], exc: subprocess.CalledProcessError) -> str:
+    stderr = (exc.stderr or "").strip()
+    stdout = (exc.stdout or "").strip()
+    output = stderr or stdout or "(no output)"
+    return f"Command failed ({' '.join(cmd)}): {output}"
+
+
+def _find_omnizart_csv(output_dir: Path, downbeat: bool) -> Path | None:
+    csv_files = sorted(output_dir.rglob("*.csv"))
+    if downbeat:
+        matches = [
+            p for p in csv_files
+            if "down" in p.stem.lower() and "beat" in p.stem.lower()
+        ]
+    else:
+        matches = [
+            p for p in csv_files
+            if "beat" in p.stem.lower() and "down" not in p.stem.lower()
+        ]
+    return matches[0] if matches else None
+
+
+def _read_time_csv(path: Path) -> list[float]:
+    times = []
+    with path.open(newline="") as f:
+        for row in csv.reader(f):
+            for cell in row:
+                try:
+                    value = float(cell.strip())
+                except ValueError:
+                    continue
+                if value >= 0:
+                    times.append(value)
+                    break
+    return sorted(set(times))
+
+
+def _safe_midi_filename(source: str) -> str:
+    name = Path(source).name or "input.mid"
+    if not name.lower().endswith((".mid", ".midi")):
+        name += ".mid"
+    return name
 
 
 def create_measures_from_annotation(annotation_data: dict, tempo_map: list[dict]) -> list[dict]:
@@ -756,7 +880,13 @@ def bake_timed_records_to_standard_ticks(records: list[dict], tempo_map: list[di
 
 # ── MIDI → TSV ─────────────────────────────────────────────────────────────
 
-def midi_to_tsv(data: bytes, source: str = "unknown.mid", annotation_path: str = None) -> str:
+def midi_to_tsv(
+    data: bytes,
+    source: str = "unknown.mid",
+    annotation_path: str | None = None,
+    auto_downbeat: bool = True,
+    midi_path: str | Path | None = None,
+) -> str:
     tpq, raw_tracks = parse_midi(data)
     if not tpq:
         raise ValueError("Only tick-based MIDI files are supported")
@@ -848,13 +978,25 @@ def midi_to_tsv(data: bytes, source: str = "unknown.mid", annotation_path: str =
         + [m["t"] for m in markers]
     )
 
-    # Determine slice type and create slices/measures
+    # Determine slice type and create slices/measures.
+    # Default MIDI->TSV conversion is measure mode: use human annotations when
+    # provided, otherwise predict performance downbeats with Omnizart.
+    annotation_source = None
     if annotation_path:
         annotation_data = parse_annotation_file(annotation_path)
+        annotation_source = "annotation"
+    elif auto_downbeat:
+        annotation_data = detect_annotation_with_omnizart(data, source=source, midi_path=midi_path)
+        annotation_source = "omnizart"
+    else:
+        annotation_data = None
+
+    if annotation_data:
         slices = create_measures_from_annotation(annotation_data, tempo_map)
+        if not slices:
+            raise ValueError("No downbeats found; cannot create measure-mode MIDI-TSV")
         # Set end tick for last measure
-        if slices:
-            slices[-1]["end"] = end_tick
+        slices[-1]["end"] = end_tick
         slice_type = "measure"
         slice_prefix = "M"
     else:
@@ -872,6 +1014,7 @@ def midi_to_tsv(data: bytes, source: str = "unknown.mid", annotation_path: str =
         "# midi-tsv v0.2",
         f"# source={source}",
         f"# slice_type={slice_type}",
+        *([f"# annotation_source={annotation_source}"] if annotation_source else []),
         "# unit=tick",
         f"# tick_scale={STANDARD_TICK_SCALE}",
         f"# tpq={STANDARD_TPQ}",
@@ -1245,6 +1388,11 @@ def main():
     p2t.add_argument("input", help="Input .mid file")
     p2t.add_argument("--out", "-o", help="Output .tsv file (default: input + '.tsv')")
     p2t.add_argument("--annotation", "-a", help="Annotation file for measure-based slicing")
+    p2t.add_argument(
+        "--no-auto-downbeat",
+        action="store_true",
+        help="Disable Omnizart downbeat detection when --annotation is not provided",
+    )
 
     t2m = sub.add_parser("tsv2midi", help="TSV → MIDI")
     t2m.add_argument("input", help="Input .tsv file")
@@ -1257,7 +1405,17 @@ def main():
         out_path = Path(args.out) if args.out else in_path.with_suffix(in_path.suffix + ".tsv")
         data = in_path.read_bytes()
         annotation_path = args.annotation if hasattr(args, 'annotation') else None
-        tsv = midi_to_tsv(data, source=in_path.name, annotation_path=annotation_path)
+        try:
+            tsv = midi_to_tsv(
+                data,
+                source=in_path.name,
+                annotation_path=annotation_path,
+                auto_downbeat=not args.no_auto_downbeat,
+                midi_path=in_path,
+            )
+        except DownbeatDetectionError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(2)
         out_path.write_text(tsv)
         print(f"Written: {out_path}")
     elif args.command == "tsv2midi":
