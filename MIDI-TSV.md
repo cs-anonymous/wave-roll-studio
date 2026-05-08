@@ -34,9 +34,12 @@
 # detected_key=C
 # slice_type=measure   # 默认：基于 annotation 或自动识别的 downbeat
 # slice_type=segment   # 仅调试/回退：启发式分片
+# phrase_type=heuristic # 可选：Measure 模式下的小节级乐句识别
+# phrase_prefix=H
 # tempo=0,500000
 
-S1	0	1140
+H1	0	4820
+M1	0	1140
 P	0	127
 C:482	0	54
 E:469	41	47
@@ -45,7 +48,7 @@ C:920	0	42
 P	172	0
 M	0	"Intro"
 
-S2	1140	2280
+M2	1140	2280
 D:420	0	60
 E:410	460	63
 ```
@@ -61,6 +64,7 @@ E:410	460	63
 | 记录类型 | 第 1 列 | 第 2 列 | 第 3 列 |
 |---------|--------|--------|--------|
 | Slice | `S<id>` | start_tick | end_tick |
+| Phrase | `H<id>` | start_tick | end_tick |
 | Note | `<pitch>:<dur>` | onset_time | velocity |
 | Sustain Pedal | `P` | time | value (0-127) |
 | Soft Pedal | `P1` | time | value (0-127) |
@@ -77,6 +81,7 @@ E:410	460	63
 ```tsv
 S<id>	<start_tick>	<end_tick>    # Segment 模式
 M<id>	<start_tick>	<end_tick>    # Measure 模式
+H<id>	<start_tick>	<end_tick>    # Phrase 结构标记
 ```
 
 **Segment 示例**：
@@ -94,6 +99,7 @@ M2	1200	2400
 **说明**：
 - `S` 前缀用于 Segment 模式（基于静音间隙启发式切分）
 - `M` 前缀用于 Measure 模式（基于 annotation 文件的音乐小节切分）
+- `H` 前缀用于 Phrase 结构标记，表示多个 `M` 小节组成的乐句
 - `start_tick` 是该 slice 的绝对起始 tick（macro-tick）
 - `end_tick` 是该 slice 的结束 tick
 - Slice 内所有事件的 time 都是相对于 `start_tick` 的偏移
@@ -435,6 +441,20 @@ MIDI-TSV 的 MIDI → TSV 默认使用基于音乐小节结构的 Measure 模式
 Omnizart beat module 从 performance MIDI 自动识别 downbeat。Segment 模式（`S`
 前缀）仅作为调试/回退路径保留。
 
+在 VS Code 插件中打开 `.mid` / `.midi` 文件时，侧边 MIDI-TSV 面板也默认尝试
+Measure 模式。插件前端本身不运行 Omnizart；它会调用扩展端配置的 Python
+解释器执行 `midi_tsv.py`。因此若要让没有 annotation 的 MIDI 自动进入 Measure
+模式，需要在 VS Code 设置中配置安装了 Omnizart 的 Python，例如：
+
+```json
+{
+  "waveRollPiano.pythonPath": "/home/sy/anaconda3/envs/omnizart38/bin/python"
+}
+```
+
+如果该 Python 不存在、没有 Omnizart beat module、或 downbeat 预测失败，插件会
+回退到 Segment 模式并显示 warning。
+
 ### 模式标识
 
 通过 header 中的 `# slice_type=` 区分：
@@ -458,6 +478,24 @@ M3	2400	3600
 ```
 
 与 `S` 前缀的 Slice 记录类似，`M` 前缀表示该切片对应一个音乐小节。start/end tick 为绝对 tick 值，slice 内事件的 time 相对于 `start_tick`。
+
+### Phrase 记录格式
+
+Measure 模式下，转换器会基于 Omnizart 或 annotation 识别出的 downbeat 小节边界，再用演奏启发式将多个小节合并为乐句：
+
+```tsv
+H<id>	<start_tick>	<end_tick>
+```
+
+`H` 是结构标记，不是 MIDI 播放事件。TSV → MIDI 时会忽略该行；若需要保留给模型或人工编辑，它可以作为当前乐句范围的上层边界。
+
+当前启发式使用：
+
+- 静音/呼吸间隙、踏板释放和重踩、长音后停顿
+- downbeat 间距变化带来的 ritardando/resume 感
+- velocity diminuendo/restart、音符密度和音区变化
+- 低权重的调性终止感
+- 4/6/8 小节长度偏好，但只作为弱先验；超过 10 小节才逐渐强制切分
 
 ### Annotation 文件格式
 

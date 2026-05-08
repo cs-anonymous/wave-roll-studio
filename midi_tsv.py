@@ -11,6 +11,8 @@ Usage:
     python midi_tsv.py midi2tsv <input.mid> --no-auto-downbeat  # segment fallback
 """
 
+from __future__ import annotations
+
 import argparse
 import csv
 import json
@@ -35,6 +37,11 @@ TARGET_SLICE_SECONDS = 20
 MAX_SLICE_SECONDS = 30
 MIN_GAP_SECONDS = 0.5
 PEDAL_VALUE_EPSILON = 3
+PHRASE_MIN_MEASURES = 3
+PHRASE_MAX_MEASURES = 10
+PHRASE_MERGE_THRESHOLD = 12
+PHRASE_SPLIT_THRESHOLD = 35
+PHRASE_PREFIX = "H"
 
 PITCH_CLASSES = [
     "C", "^C", "D", "^D", "E", "F", "^F", "G", "^G", "A", "^A", "B"
@@ -245,7 +252,7 @@ def midi_pitch_to_abc(pitch: int) -> str:
     letter = spelled[1:] if accidental else spelled
 
     if octave > 0:
-        return f"{accidental}{letter.lower()}{'\'' * (octave - 1)}"
+        return f"{accidental}{letter.lower()}{chr(39) * (octave - 1)}"
     elif octave < 0:
         return f"{accidental}{letter}{',' * (-octave)}"
     return f"{accidental}{letter}"
@@ -276,7 +283,7 @@ def midi_pitch_to_abc_smart(pitch: int, key: str) -> str:
     letter = spelled[len(accidental):]
 
     if octave > 0:
-        return f"{accidental}{letter.lower()}{'\'' * (octave - 1)}"
+        return f"{accidental}{letter.lower()}{chr(39) * (octave - 1)}"
     if octave < 0:
         return f"{accidental}{letter}{',' * (-octave)}"
     return f"{accidental}{letter}"
@@ -634,6 +641,371 @@ def _find_weak_cut_candidates(notes: list[dict], pedals: list[dict], min_gap_tic
                 cuts.append(round((end_time + next_start) / 2))
 
     return sorted(set(cuts))
+
+
+def create_phrases_from_measures(
+    notes: list[dict],
+    pedals: list[dict],
+    measures: list[dict],
+    key: str,
+) -> list[dict]:
+    """Group measure slices into performance-aware phrases.
+
+    The detector treats 4/6/8-measure lengths as a soft prior, then lets
+    performed evidence (breath gaps, pedal resets, ritardando-like downbeat
+    spacing, velocity taper, long endings, texture changes, and weak tonal
+    closure) decide the actual boundary.
+    """
+    valid_measures = [m for m in measures if m.get("end") is not None]
+    if not valid_measures:
+        return []
+    if len(valid_measures) == 1:
+        return [_make_phrase(1, valid_measures, 0, 1)]
+
+    scores = _compute_phrase_boundary_scores(notes, pedals, valid_measures, key)
+    segments = _adaptive_phrase_segmentation(scores, valid_measures)
+    segments = _merge_short_phrases(segments)
+    return [
+        _make_phrase(phrase_id, valid_measures, start, end)
+        for phrase_id, (start, end) in enumerate(segments, 1)
+    ]
+
+
+def _compute_phrase_boundary_scores(
+    notes: list[dict],
+    pedals: list[dict],
+    measures: list[dict],
+    key: str,
+) -> list[float]:
+    scores = []
+    measure_durations = [max(1, m["end"] - m["start"]) for m in measures]
+    global_median_duration = _median(measure_durations) or 1
+    tonic = _key_to_tonic_pc(key)
+    dominant = (tonic + 7) % 12
+
+    for i in range(len(measures) - 1):
+        current = measures[i]
+        previous = measures[i - 1] if i > 0 else None
+        nxt = measures[i + 1]
+        score = 0.0
+
+        current_notes = _notes_in_range(notes, current["start"], current["end"])
+        next_notes = _notes_in_range(notes, nxt["start"], nxt["end"])
+        previous_notes = (
+            _notes_in_range(notes, previous["start"], previous["end"])
+            if previous else []
+        )
+
+        boundary_tick = current["end"]
+        gap_ticks, sound_crosses = _sound_gap_to_next_onset(notes, pedals, boundary_tick, nxt["end"])
+        if gap_ticks >= 40:
+            score += 80
+        elif gap_ticks >= 25:
+            score += 55
+        elif gap_ticks >= 12:
+            score += 25
+        if sound_crosses:
+            score -= 80
+
+        if _pedal_release_near(pedals, boundary_tick):
+            score += 45
+        if _pedal_restarts_near(pedals, boundary_tick):
+            score += 20
+        if _sustain_on_at(pedals, boundary_tick + 1):
+            score -= 35
+
+        local_prev_duration = _median(measure_durations[max(0, i - 2):i + 1]) or global_median_duration
+        current_duration = measure_durations[i]
+        next_duration = measure_durations[i + 1]
+        if current_duration > local_prev_duration * 1.08:
+            score += 28
+            if next_duration < current_duration * 0.94:
+                score += 14
+        if current_duration > global_median_duration * 1.45 or current_duration < global_median_duration * 0.55:
+            score -= 30
+
+        if _velocity_tapers(current_notes):
+            score += 30
+        if current_notes and next_notes:
+            current_tail_vel = _average_velocity(_notes_in_fraction(current_notes, current, 0.55, 1.0))
+            next_head_vel = _average_velocity(_notes_in_fraction(next_notes, nxt, 0.0, 0.45))
+            if current_tail_vel is not None and next_head_vel is not None and next_head_vel - current_tail_vel >= 8:
+                score += 14
+
+        if _has_long_final_sonority(current_notes, current):
+            score += 30
+            if gap_ticks >= 12:
+                score += 12
+
+        score += _texture_change_score(current_notes, next_notes, current, nxt)
+        score += _tonal_closure_score(previous_notes, current_notes, current, tonic, dominant)
+
+        if _continuous_run_crosses_boundary(notes, boundary_tick):
+            score -= 35
+
+        scores.append(score)
+
+    return scores
+
+
+def _adaptive_phrase_segmentation(scores: list[float], measures: list[dict]) -> list[tuple[int, int]]:
+    segments = []
+    start = 0
+    n = len(measures)
+    median_duration = _median([m["end"] - m["start"] for m in measures]) or 1
+    first_is_pickup = (measures[0]["end"] - measures[0]["start"]) < median_duration * 0.65
+
+    while start < n:
+        remaining = n - start
+        min_len = PHRASE_MIN_MEASURES + (1 if start == 0 and first_is_pickup else 0)
+        max_len = PHRASE_MAX_MEASURES + (1 if start == 0 and first_is_pickup else 0)
+
+        if remaining <= min_len:
+            segments.append((start, n))
+            break
+
+        # If the rest is already a plausible phrase, only split on a strong boundary.
+        force_split = remaining > max_len
+        candidate_max_end = min(start + max_len, n - PHRASE_MIN_MEASURES)
+        if candidate_max_end < start + min_len:
+            segments.append((start, n))
+            break
+
+        best_end = None
+        best_score = float("-inf")
+        for end in range(start + min_len, candidate_max_end + 1):
+            boundary_idx = end - 1
+            if boundary_idx >= len(scores):
+                continue
+            phrase_len = end - start
+            candidate_score = scores[boundary_idx] + _phrase_length_bonus(phrase_len)
+            tail_len = n - end
+            if 0 < tail_len < PHRASE_MIN_MEASURES:
+                candidate_score -= 50
+            if candidate_score > best_score:
+                best_score = candidate_score
+                best_end = end
+
+        if best_end is None:
+            segments.append((start, n))
+            break
+        if not force_split and best_score < PHRASE_SPLIT_THRESHOLD and remaining <= PHRASE_MAX_MEASURES:
+            segments.append((start, n))
+            break
+
+        segments.append((start, best_end))
+        start = best_end
+
+    return segments
+
+
+def _merge_short_phrases(segments: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    merged = []
+    i = 0
+    while i < len(segments):
+        start, end = segments[i]
+        length = end - start
+        if length < PHRASE_MIN_MEASURES:
+            if merged and end - merged[-1][0] <= PHRASE_MERGE_THRESHOLD:
+                merged[-1] = (merged[-1][0], end)
+            elif i + 1 < len(segments) and segments[i + 1][1] - start <= PHRASE_MERGE_THRESHOLD:
+                merged.append((start, segments[i + 1][1]))
+                i += 1
+            else:
+                merged.append((start, end))
+        else:
+            merged.append((start, end))
+        i += 1
+    return merged
+
+
+def _make_phrase(phrase_id: int, measures: list[dict], start: int, end: int) -> dict:
+    start_measure = measures[start]
+    end_measure = measures[end - 1]
+    return {
+        "id": phrase_id,
+        "start": start_measure["start"],
+        "end": end_measure["end"],
+        "start_measure": start_measure["id"],
+        "end_measure": end_measure["id"],
+    }
+
+
+def _phrase_length_bonus(length: int) -> int:
+    if length == 4:
+        return 28
+    if length == 8:
+        return 22
+    if length == 6:
+        return 14
+    if length in (5, 7):
+        return 8
+    if length < 4:
+        return -10
+    return -5 * max(0, length - 8)
+
+
+def _notes_in_range(notes: list[dict], start: int, end: int) -> list[dict]:
+    return [n for n in notes if start <= n["t"] < end]
+
+
+def _notes_in_fraction(notes: list[dict], measure: dict, start_frac: float, end_frac: float) -> list[dict]:
+    duration = max(1, measure["end"] - measure["start"])
+    start = measure["start"] + duration * start_frac
+    end = measure["start"] + duration * end_frac
+    return [n for n in notes if start <= n["t"] < end]
+
+
+def _sound_gap_to_next_onset(
+    notes: list[dict],
+    pedals: list[dict],
+    boundary_tick: int,
+    search_end: int,
+) -> tuple[int, bool]:
+    next_onsets = [n["t"] for n in notes if boundary_tick <= n["t"] < search_end]
+    if not next_onsets:
+        return 0, _sustain_on_at(pedals, boundary_tick + 1)
+    next_onset = min(next_onsets)
+    sounding_before_next = [
+        n["t"] + n["dur"]
+        for n in notes
+        if n["t"] < next_onset and n["t"] + n["dur"] > n["t"]
+    ]
+    last_sound_end = max(sounding_before_next, default=boundary_tick)
+    if _sustain_on_at(pedals, boundary_tick + 1):
+        last_sound_end = max(last_sound_end, next_onset)
+    sound_crosses = any(n["t"] < boundary_tick < n["t"] + n["dur"] for n in notes)
+    gap = max(0, next_onset - last_sound_end)
+    return gap, sound_crosses
+
+
+def _pedal_release_near(pedals: list[dict], tick: int) -> bool:
+    return any(
+        p["type"] == "P" and p["val"] < 64 and tick - 12 <= p["t"] <= tick + 30
+        for p in pedals
+    )
+
+
+def _pedal_restarts_near(pedals: list[dict], tick: int) -> bool:
+    return any(
+        p["type"] == "P" and p["val"] >= 64 and tick - 5 <= p["t"] <= tick + 40
+        for p in pedals
+    )
+
+
+def _sustain_on_at(pedals: list[dict], tick: int) -> bool:
+    state = False
+    for pedal in sorted((p for p in pedals if p["type"] == "P"), key=lambda p: p["t"]):
+        if pedal["t"] > tick:
+            break
+        state = pedal["val"] >= 64
+    return state
+
+
+def _velocity_tapers(measure_notes: list[dict]) -> bool:
+    if len(measure_notes) < 4:
+        return False
+    ordered = sorted(measure_notes, key=lambda n: n["t"])
+    midpoint = max(1, len(ordered) // 2)
+    head = _average_velocity(ordered[:midpoint])
+    tail = _average_velocity(ordered[midpoint:])
+    return head is not None and tail is not None and head - tail >= 6
+
+
+def _average_velocity(notes: list[dict]) -> float | None:
+    if not notes:
+        return None
+    return sum(n["vel"] for n in notes) / len(notes)
+
+
+def _has_long_final_sonority(measure_notes: list[dict], measure: dict) -> bool:
+    if not measure_notes:
+        return False
+    duration = max(1, measure["end"] - measure["start"])
+    final_window = measure["start"] + duration * 0.55
+    tail_notes = [n for n in measure_notes if n["t"] >= final_window]
+    if not tail_notes:
+        return False
+    median_dur = _median([max(1, n["dur"]) for n in measure_notes]) or 1
+    return max(n["dur"] for n in tail_notes) >= max(median_dur * 1.8, duration * 0.35)
+
+
+def _texture_change_score(current_notes: list[dict], next_notes: list[dict], current: dict, nxt: dict) -> float:
+    if not current_notes or not next_notes:
+        return 0.0
+    current_density = len(current_notes) / max(1, current["end"] - current["start"])
+    next_density = len(next_notes) / max(1, nxt["end"] - nxt["start"])
+    density_ratio = max(current_density, next_density) / max(0.0001, min(current_density, next_density))
+    current_register = sum(n["pitch"] for n in current_notes) / len(current_notes)
+    next_register = sum(n["pitch"] for n in next_notes) / len(next_notes)
+    score = 0.0
+    if density_ratio >= 1.8:
+        score += 18
+    if abs(next_register - current_register) >= 7:
+        score += 15
+    return score
+
+
+def _tonal_closure_score(
+    previous_notes: list[dict],
+    current_notes: list[dict],
+    measure: dict,
+    tonic: int,
+    dominant: int,
+) -> float:
+    if not current_notes:
+        return 0.0
+    tail_notes = _notes_in_fraction(current_notes, measure, 0.65, 1.0)
+    if not tail_notes:
+        tail_notes = current_notes[-min(4, len(current_notes)):]
+    tail_pcs = {n["pitch"] % 12 for n in tail_notes}
+    score = 0.0
+    if tonic in tail_pcs:
+        score += 8
+    last_time = max(n["t"] for n in tail_notes)
+    last_chord = [n for n in tail_notes if abs(n["t"] - last_time) <= 5]
+    if last_chord:
+        bass_pc = min(last_chord, key=lambda n: n["pitch"])["pitch"] % 12
+        melody_pc = max(last_chord, key=lambda n: n["pitch"])["pitch"] % 12
+        if bass_pc == tonic:
+            score += 8
+        if melody_pc == tonic:
+            score += 6
+    if previous_notes:
+        previous_pcs = {n["pitch"] % 12 for n in previous_notes[-min(12, len(previous_notes)):]}
+        if dominant in previous_pcs and tonic in tail_pcs:
+            score += 8
+    return score
+
+
+def _continuous_run_crosses_boundary(notes: list[dict], boundary_tick: int) -> bool:
+    before = [n for n in notes if boundary_tick - 18 <= n["t"] < boundary_tick]
+    after = [n for n in notes if boundary_tick <= n["t"] <= boundary_tick + 18]
+    return len(before) >= 3 and len(after) >= 3
+
+
+def _key_to_tonic_pc(key: str) -> int:
+    match = re.match(r"^([A-G])([#b]?)", key or "C")
+    if not match:
+        return 0
+    letter = match.group(1).upper()
+    accidental = match.group(2)
+    pc = NATURAL_PITCH_CLASS.get(letter, 0)
+    if accidental == "#":
+        pc += 1
+    elif accidental == "b":
+        pc -= 1
+    return pc % 12
+
+
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2
 
 
 def _find_slice_local_start(notes, pedals, markers, slice_, slices) -> int:
@@ -1008,6 +1380,12 @@ def midi_to_tsv(
     pedals = smart_quantize_pedals_between_notes(baked_pedals, notes, slices)
 
     detected_key = detect_key_from_notes(notes)
+    phrases = (
+        create_phrases_from_measures(notes, baked_pedals, slices, detected_key)
+        if slice_type == "measure"
+        else []
+    )
+    phrases_by_start_measure = {phrase["start_measure"]: phrase for phrase in phrases}
 
     # Build output
     lines: list[str] = [
@@ -1015,6 +1393,10 @@ def midi_to_tsv(
         f"# source={source}",
         f"# slice_type={slice_type}",
         *([f"# annotation_source={annotation_source}"] if annotation_source else []),
+        *([
+            "# phrase_type=heuristic",
+            f"# phrase_prefix={PHRASE_PREFIX}",
+        ] if phrases else []),
         "# unit=tick",
         f"# tick_scale={STANDARD_TICK_SCALE}",
         f"# tpq={STANDARD_TPQ}",
@@ -1037,6 +1419,10 @@ def midi_to_tsv(
 
     for sl in slices:
         local_start = _find_slice_local_start(notes, pedals, markers, sl, slices)
+
+        phrase = phrases_by_start_measure.get(sl["id"])
+        if phrase:
+            lines.append(f"{PHRASE_PREFIX}{phrase['id']}\t{phrase['start']}\t{phrase['end']}")
 
         lines.append(f"{slice_prefix}{sl['id']}\t{local_start}\t{sl['end']}")
 
@@ -1154,6 +1540,10 @@ def _tsv_v2_to_midi(tsv: str, meta: dict) -> bytes:
                 "type": "meta", "meta_type": 0x06,
                 "payload": text.encode("utf-8"),
             })
+        elif _is_phrase_record(record_type):
+            _require(fields, 3, line_idx)
+            # Phrase records are structural TSV annotations; playback ignores them.
+            continue
         else:
             raise ValueError(f"Line {line_idx+1}: unknown record type {record_type!r}")
 
@@ -1210,6 +1600,9 @@ def _tsv_v1_to_midi(tsv: str, meta: dict) -> bytes:
                 "tick": current_slice_start + local_t, "order": 1,
                 "type": "control_change", "channel": channel, "controller": 64, "value": val,
             })
+        elif _is_phrase_record(record_type):
+            _require(fields, 3, line_idx)
+            continue
         else:
             raise ValueError(f"Line {line_idx+1}: unknown record type {record_type!r}")
 
@@ -1331,6 +1724,10 @@ def _is_slice_record(s: str, prefix: str = None) -> bool:
     if prefix:
         return bool(re.match(rf"^{prefix}\d+$", s))
     return bool(re.match(r"^[SM]\d+$", s))
+
+
+def _is_phrase_record(s: str) -> bool:
+    return bool(re.match(rf"^{PHRASE_PREFIX}\d+$", s))
 
 
 def _is_note_record(s: str) -> bool:

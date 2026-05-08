@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { MidiEditorProvider } from "./midiEditorProvider";
 import { isMidiTsvUriPath, midiToTsv, tsvToMidi } from "./midiTsv";
+import { midiToMeasureTsv } from "./pythonMidiTsv";
 
 /**
  * Activates the WaveRoll Studio extension.
@@ -24,7 +25,7 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.commands.registerCommand(
       "wave-roll-piano.exportMidiTsv",
-      exportMidiAsTsv
+      (uri?: vscode.Uri) => exportMidiAsTsv(context, uri)
     ),
     vscode.commands.registerCommand(
       "wave-roll-piano.exportTsvMidi",
@@ -40,7 +41,10 @@ export function deactivate(): void {
   // Cleanup if needed
 }
 
-async function exportMidiAsTsv(uri?: vscode.Uri): Promise<void> {
+async function exportMidiAsTsv(
+  context: vscode.ExtensionContext,
+  uri?: vscode.Uri
+): Promise<void> {
   const inputUri = await resolveInputUri(uri, {
     "MIDI Files": ["mid", "midi"],
   });
@@ -56,7 +60,7 @@ async function exportMidiAsTsv(uri?: vscode.Uri): Promise<void> {
 
   const filename = inputUri.path.split("/").pop() ?? "unknown.mid";
   const data = await vscode.workspace.fs.readFile(inputUri);
-  const tsv = midiToTsv(data, filename);
+  const tsv = await midiToTsvForExport(context, inputUri, data, filename);
   const targetUri = await getUniqueFileUri(
     vscode.Uri.joinPath(inputUri, ".."),
     `${filename}.tsv`
@@ -154,4 +158,21 @@ async function fileExists(uri: vscode.Uri): Promise<boolean> {
 function isMidiUriPath(path: string): boolean {
   const lower = path.toLowerCase();
   return lower.endsWith(".mid") || lower.endsWith(".midi");
+}
+
+async function midiToTsvForExport(
+  context: vscode.ExtensionContext,
+  uri: vscode.Uri,
+  data: Uint8Array,
+  filename: string
+): Promise<string> {
+  try {
+    return (await midiToMeasureTsv(context, uri, filename)).tsv;
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    vscode.window.showWarningMessage(
+      `WaveRoll Studio: Measure mode export failed; falling back to Slice mode. ${errorMsg}`
+    );
+    return midiToTsv(data, filename);
+  }
 }

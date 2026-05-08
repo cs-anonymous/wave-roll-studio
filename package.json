@@ -61,6 +61,16 @@
         "title": "WaveRoll Piano: Export MIDI-TSV as MIDI"
       }
     ],
+    "configuration": {
+      "title": "WaveRoll Piano",
+      "properties": {
+        "waveRollPiano.pythonPath": {
+          "type": "string",
+          "default": "",
+          "description": "Python executable used for measure-mode MIDI-TSV conversion with midi_tsv.py and Omnizart. Leave empty to try python3, then python."
+        }
+      }
+    },
     "menus": {
       "explorer/context": [
         {

@@ -21,6 +21,143 @@ Right-click in explorer:
 - **Export MIDI as TSV** — convert `.mid` to `.mid.tsv`
 - **Export MIDI-TSV as MIDI** — convert `.mid.tsv` back to `.mid`
 
+## Default MIDI Opening Behavior
+
+When the extension opens a `.mid` or `.midi` file, it first converts the MIDI to
+MIDI-TSV for the side panel. The default target is **Measure mode**:
+
+```tsv
+# slice_type=measure
+# annotation_source=annotation
+M1	0	1200
+M2	1200	2400
+```
+
+If an annotation file is available next to the MIDI file, it is used first. The
+extension currently looks for:
+
+- `<midi_stem>_annotations.txt`
+- `annotations.txt`
+
+If no annotation file is found, the extension calls Omnizart's beat module to
+predict downbeats and uses those downbeats as measure starts:
+
+```tsv
+# slice_type=measure
+# annotation_source=omnizart
+M1	...
+M2	...
+```
+
+If the configured Python environment is missing or Omnizart fails, the MIDI still
+opens, but the TSV panel falls back to the old heuristic Slice mode:
+
+```tsv
+# slice_type=segment
+S1	...
+S2	...
+```
+
+## Python / Omnizart Setup
+
+The piano-roll UI runs inside VS Code, but Measure-mode MIDI-TSV conversion uses
+Python because Omnizart is a Python package. For normal MIDI playback/visual
+display, Python is not needed. For default Measure-mode TSV generation, Python
+and Omnizart must be installed and configured.
+
+Omnizart's current GitHub version requires Python `<3.9`. Do not downgrade an
+existing modern `base` environment just for Omnizart. Create a dedicated conda
+environment instead.
+
+### 1. Install System Packages
+
+Ubuntu / Debian:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y libsndfile-dev fluidsynth ffmpeg
+```
+
+### 2. Create A Dedicated Conda Environment
+
+```bash
+conda create -n omnizart38 -y python=3.8 pip
+conda activate omnizart38
+```
+
+### 3. Install Omnizart
+
+Install Cython/Numpy first, then build `madmom`, then install Omnizart from
+GitHub. The GitHub version is required because the PyPI `omnizart==0.1.0` package
+does not include the `omnizart.beat` module used for downbeat prediction.
+
+```bash
+python -m pip install "numpy<1.24" "Cython<3"
+python -m pip install --no-build-isolation madmom==0.16.1
+python -m pip install --pre keras-nightly~=2.5.0.dev -i https://pypi.org/simple
+python -m pip install --pre "git+https://github.com/Music-and-Culture-Technology-Lab/omnizart.git"
+```
+
+### 4. Download Checkpoints
+
+```bash
+omnizart download-checkpoints
+```
+
+This downloads several model checkpoints, including the beat model used by
+Measure mode. The beat checkpoint is relatively large, so the command can take a
+while.
+
+### 5. Verify The Beat Module
+
+```bash
+python - <<'PY'
+import omnizart
+from omnizart.beat.app import BeatTranscription
+print("omnizart", omnizart.__version__)
+print("BeatTranscription OK")
+PY
+
+omnizart beat transcribe --help
+```
+
+Optional smoke test:
+
+```bash
+mkdir -p /tmp/omnizart-beat-test
+omnizart beat transcribe -o /tmp/omnizart-beat-test path/to/input.mid
+ls /tmp/omnizart-beat-test
+```
+
+Expected output includes:
+
+```text
+<name>_beat.csv
+<name>_down_beat.csv
+```
+
+## VS Code Configuration
+
+Set the extension's Python path to the environment that contains Omnizart.
+
+Workspace `.vscode/settings.json` example:
+
+```json
+{
+  "waveRollPiano.pythonPath": "/home/sy/anaconda3/envs/omnizart38/bin/python"
+}
+```
+
+The extension tries Python executables in this order:
+
+1. `waveRollPiano.pythonPath`
+2. `python3`
+3. `python`
+
+For a packaged install, configure this before relying on Measure mode. If it is
+not configured and the default `python3` does not contain Omnizart, the extension
+falls back to Slice mode and shows a warning.
+
 ## MIDI-TSV Format
 
 See [MIDI-TSV.md](MIDI-TSV.md) for the full format specification covering:

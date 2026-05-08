@@ -342,6 +342,9 @@ function tsvV2ToMidi(tsv: string, meta: TsvMeta): Uint8Array {
       requireFieldCount(fields, 3, lineIndex);
       currentSliceStart =
         parseNonNegativeInt(fields[1], "slice start", lineIndex) * meta.tickScale;
+    } else if (isPhraseRecord(recordType)) {
+      requireFieldCount(fields, 3, lineIndex);
+      // Phrase rows are structural annotations for the TSV view, not MIDI events.
     } else if (isNoteRecord(recordType)) {
       requireFieldCount(fields, 3, lineIndex);
       const [pitchAbc, durMacro] = parseNoteRecord(recordType, lineIndex);
@@ -414,6 +417,8 @@ function tsvV1ToMidi(tsv: string, meta: TsvMeta): Uint8Array {
       requireFieldCount(fields, 4, lineIndex);
       currentSliceStart =
         parseNonNegativeInt(fields[2], "slice start", lineIndex) * meta.tickScale;
+    } else if (isPhraseRecord(recordType)) {
+      requireFieldCount(fields, 3, lineIndex);
     } else if (recordType === "T") {
       requireFieldCount(fields, 2, lineIndex);
       currentTrackId = parsePositiveInt(fields[1], "track id", lineIndex);
@@ -917,6 +922,10 @@ function sortTimed<T extends { t?: number; tick?: number }>(a: T, b: T): number 
 
 function isSliceRecord(s: string): boolean {
   return /^[SM]\d+$/.test(s);
+}
+
+function isPhraseRecord(s: string): boolean {
+  return /^H\d+$/.test(s);
 }
 
 function isPedalRecord(s: string): s is PedalType {

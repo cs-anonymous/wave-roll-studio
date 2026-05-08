@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import * as crypto from "crypto";
 import { isMidiTsvUriPath, midiToTsv, tsvToMidi } from "./midiTsv";
+import { midiToMeasureTsv } from "./pythonMidiTsv";
 
 /**
  * Custom document for MIDI files.
@@ -85,7 +86,7 @@ export class MidiEditorProvider
     const filename = this.getDocumentFilename(uri);
     const tsv = isTsv
       ? new TextDecoder("utf-8").decode(rawData)
-      : midiToTsv(data, filename);
+      : await this.midiToTsv(uri, data, filename);
 
     return {
       uri,
@@ -372,16 +373,15 @@ export class MidiEditorProvider
   ): Promise<void> {
     try {
       const newMidiData = tsvToMidi(editedTsv);
-      const newTsv = midiToTsv(newMidiData, document.filename);
 
       (document as any).data = newMidiData;
-      (document as any).tsv = newTsv;
+      (document as any).tsv = editedTsv;
 
       await vscode.workspace.fs.writeFile(document.uri, newMidiData);
 
       webview.postMessage({
         type: "tsv-saved",
-        tsv: newTsv,
+        tsv: editedTsv,
       });
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : "Unknown error";
@@ -412,6 +412,25 @@ export class MidiEditorProvider
       return filename.replace(/\.tsv$/i, "");
     }
     return filename;
+  }
+
+  private async midiToTsv(
+    uri: vscode.Uri,
+    data: Uint8Array,
+    filename: string
+  ): Promise<string> {
+    try {
+      const result = await midiToMeasureTsv(this.context, uri, filename);
+      const source = result.annotationPath ? "annotation" : "Omnizart";
+      console.log(`[WaveRoll] MIDI-TSV measure mode generated via ${source}`);
+      return result.tsv;
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      vscode.window.showWarningMessage(
+        `WaveRoll Studio: Measure mode conversion failed; falling back to Slice mode. ${errorMsg}`
+      );
+      return midiToTsv(data, filename);
+    }
   }
 
   /**

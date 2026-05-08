@@ -61,7 +61,7 @@ let tsvEditor: HTMLTextAreaElement | null = null;
 interface TsvRow {
   lineNumber: number;
   raw: string;
-  type: "S" | "T" | "N" | "P" | "M" | "meta" | "blank" | "other";
+  type: "S" | "H" | "T" | "N" | "P" | "M" | "meta" | "blank" | "other";
   absTick?: number;
   durTick?: number;
   trackId?: number;
@@ -687,6 +687,18 @@ function parseTsvIndex(tsv: string): TsvIndex {
         raw,
         type: "S",
         absTick: currentSliceStart,
+      });
+      return;
+    }
+
+    if (/^H\d+$/.test(fields[0]) && fields.length >= 3) {
+      const phraseStart = Number(fields[1]) * tickScale;
+      endTick = Math.max(endTick, Number(fields[2]) * tickScale);
+      rows.push({
+        lineNumber,
+        raw,
+        type: "H",
+        absTick: phraseStart,
       });
       return;
     }
