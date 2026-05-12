@@ -38,9 +38,9 @@ MAX_SLICE_SECONDS = 30
 MIN_GAP_SECONDS = 0.5
 PEDAL_VALUE_EPSILON = 3
 PHRASE_MIN_MEASURES = 3
-PHRASE_MAX_MEASURES = 10
-PHRASE_MERGE_THRESHOLD = 12
-PHRASE_SPLIT_THRESHOLD = 35
+PHRASE_MAX_MEASURES = 8
+PHRASE_MERGE_THRESHOLD = 10
+PHRASE_SPLIT_THRESHOLD = 20
 PHRASE_PREFIX = "H"
 
 PITCH_CLASSES = [
@@ -835,14 +835,14 @@ def _phrase_length_bonus(length: int) -> int:
     if length == 4:
         return 28
     if length == 8:
-        return 22
+        return 34
     if length == 6:
         return 14
     if length in (5, 7):
         return 8
     if length < 4:
         return -10
-    return -5 * max(0, length - 8)
+    return -18 * max(0, length - PHRASE_MAX_MEASURES)
 
 
 def _notes_in_range(notes: list[dict], start: int, end: int) -> list[dict]:
@@ -1418,7 +1418,11 @@ def midi_to_tsv(
     lines.append("")
 
     for sl in slices:
-        local_start = _find_slice_local_start(notes, pedals, markers, sl, slices)
+        local_start = (
+            sl["start"]
+            if slice_type == "measure"
+            else _find_slice_local_start(notes, pedals, markers, sl, slices)
+        )
 
         phrase = phrases_by_start_measure.get(sl["id"])
         if phrase:
